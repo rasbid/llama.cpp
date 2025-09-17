@@ -2659,6 +2659,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MAIN_GPU"));
     add_opt(common_arg(
+        {"--offload-input-layer"},
+        "offload the input layer to device memory when possible",
+        [](common_params & params) {
+            params.offload_input_layer = true;
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Input layer offload has no effect.\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_OFFLOAD_INPUT_LAYER"));
+    add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
         [](common_params & params) {

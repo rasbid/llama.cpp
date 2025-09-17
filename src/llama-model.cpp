@@ -2093,8 +2093,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     };
 
     // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // historically this was always kept on the CPU as the benefit is typically small,
+    // but some multi-GPU backends (e.g. Vulkan) may benefit from placing it on device memory
+    if (params.offload_input_layer && !devices.empty()) {
+        llama_model::impl::layer_dev input_dev;
+        if (act_gpu_layers > 0) {
+            // reuse the device assignment of the first GPU-resident layer
+            input_dev = get_layer_buft_list(i_gpu_start);
+        } else {
+            // fallback to the first configured device when no repeating layer is offloaded
+            auto * dev = devices.front();
+            input_dev = { dev, &pimpl->gpu_buft_list.at(dev) };
+        }
+        pimpl->dev_input = input_dev;
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
@@ -19408,6 +19422,7 @@ llama_model_params llama_model_default_params() {
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
+        /*.offload_input_layer         =*/ false,
     };
 
     return result;
