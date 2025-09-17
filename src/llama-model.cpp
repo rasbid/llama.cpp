@@ -19422,7 +19422,7 @@ llama_model_params llama_model_default_params() {
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
-        /*.offload_input_layer         =*/ false,
+        /*.offload_input_layer         =*/ true,
     };
 
     return result;
