@@ -3801,6 +3801,19 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const uint32_t compute_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eCompute, vk::QueueFlagBits::eGraphics, -1, 1);
         const uint32_t transfer_queue_family_index = ggml_vk_find_queue_family_index(queue_family_props, vk::QueueFlagBits::eTransfer, vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics, compute_queue_family_index, 1);
 
+        if (device->shader_core_count == 0) {
+            const uint32_t queue_count = compute_queue_family_index < queue_family_props.size() ?
+                queue_family_props[compute_queue_family_index].queueCount : 0;
+            const uint32_t subgroup_size = device->subgroup_size > 0 ? device->subgroup_size : 1;
+            uint32_t estimated_shader_cores = queue_count * subgroup_size;
+            if (estimated_shader_cores == 0) {
+                estimated_shader_cores = 1;
+            }
+            device->shader_core_count = estimated_shader_cores;
+            VK_LOG_DEBUG("ggml_vulkan: estimated shader core count " << device->shader_core_count <<
+                         " using queueCount " << queue_count << " and subgroup size " << subgroup_size);
+        }
+
         const float priorities[] = { 1.0f, 1.0f };
         device->single_queue = compute_queue_family_index == transfer_queue_family_index && queue_family_props[compute_queue_family_index].queueCount == 1;
 
