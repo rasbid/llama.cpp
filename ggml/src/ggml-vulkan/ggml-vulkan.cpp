@@ -180,11 +180,6 @@ struct vk_command_pool {
     vk_queue *q;
 };
 
-// Prevent simultaneous submissions to the same queue.
-// This could be per vk_queue if we stopped having two vk_queue structures
-// sharing the same vk::Queue.
-static std::mutex queue_mutex;
-
 struct vk_queue {
     uint32_t queue_family_index;
     vk::Queue queue;
@@ -195,12 +190,15 @@ struct vk_queue {
 
     bool transfer_only;
 
+    std::shared_ptr<std::mutex> submit_mutex;
+
     // copy everything except the cmd_pool
     void copyFrom(vk_queue &other) {
         queue_family_index = other.queue_family_index;
         queue = other.queue;
         stage_flags = other.stage_flags;
         transfer_only = other.transfer_only;
+        submit_mutex = other.submit_mutex;
     }
 };
 
@@ -1718,7 +1716,8 @@ static vk::CommandBuffer ggml_vk_create_cmd_buffer(vk_device& device, vk_command
 static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
     if (ctx->seqs.empty()) {
         if (fence) {
-            std::lock_guard<std::mutex> guard(queue_mutex);
+            GGML_ASSERT(ctx->p && ctx->p->q && ctx->p->q->submit_mutex);
+            std::lock_guard<std::mutex> guard(*ctx->p->q->submit_mutex);
             ctx->p->q->queue.submit({}, fence);
         }
         return;
@@ -1788,7 +1787,8 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
-    std::lock_guard<std::mutex> guard(queue_mutex);
+    GGML_ASSERT(ctx->p && ctx->p->q && ctx->p->q->submit_mutex);
+    std::lock_guard<std::mutex> guard(*ctx->p->q->submit_mutex);
     ctx->p->q->queue.submit(submit_infos, fence);
 
     ctx->seqs.clear();
@@ -1846,6 +1846,7 @@ static void ggml_vk_create_queue(vk_device& device, vk_queue& q, uint32_t queue_
 
     q.queue_family_index = queue_family_index;
     q.transfer_only = transfer_only;
+    q.submit_mutex = std::make_shared<std::mutex>();
 
     q.cmd_pool.init(device, &q);
 
