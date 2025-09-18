@@ -11624,7 +11624,7 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_vk_buffer_read_async(transfer_ctx, buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
-static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t dst_backend, ggml_backend_t src_backend, const ggml_tensor *src, ggml_tensor *dst) {
+static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend, const ggml_tensor *src, ggml_tensor *dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async()");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     if ((dst->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || dst->buffer->buft == ggml_backend_vk_host_buffer_type()) && ggml_backend_buffer_is_vk(src->buffer)) {
