@@ -2250,6 +2250,11 @@ struct GpuPipelineConfig {
 };
 
 // Pipeline configuration for RDNA1 GPUs.
+static const std::unordered_map<std::string, uint32_t> gcn_pipelines = {
+    {"soft_max", 64}, {"soft_max_back", 64},
+    {"argmax", 64}, {"mul_mat_vec", 64},
+};
+
 static const std::unordered_map<std::string, uint32_t> rdna1_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
     {"argmax", 64}, {"mul_mat_vec", 64},
@@ -2261,10 +2266,18 @@ static const std::unordered_map<std::string, uint32_t> rdna2_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
 };
 
+static constexpr uint32_t GCN_DEFAULT_SUBGROUP_SIZE = 64;
 static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;
 
 // Define configurations for different GPUs.
 static std::vector<GpuPipelineConfig> gpu_pipeline_configs = {
+    {
+        vk_device_architecture::AMD_GCN,
+        {
+            gcn_pipelines,
+        },
+        GCN_DEFAULT_SUBGROUP_SIZE
+    },
     {
         vk_device_architecture::AMD_RDNA1,
         {
@@ -3051,7 +3064,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
         rm_stdq = 2;
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    const bool disable_gcn_subgroups = device->architecture == vk_device_architecture::AMD_GCN &&
+                                       getenv("GGML_VK_DISABLE_GCN_SUBGROUPS") != nullptr;
+    const bool allow_gcn_subgroups = device->architecture != vk_device_architecture::AMD_GCN ||
+                                     (!disable_gcn_subgroups && device->subgroup_shuffle && device->subgroup_ballot);
+    const bool use_subgroups = device->subgroup_arithmetic && allow_gcn_subgroups;
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
@@ -3632,6 +3649,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool fp16_compute = false;
         bool maintenance4_support = false;
         bool sm_builtins = false;
+        bool amd_shader_core_properties = false;
         bool amd_shader_core_properties2 = false;
         bool pipeline_robustness = false;
         bool coopmat2_support = false;
@@ -3649,6 +3667,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 fp16_compute = true;
             } else if (strcmp("VK_NV_shader_sm_builtins", properties.extensionName) == 0) {
                 sm_builtins = true;
+            } else if (strcmp("VK_AMD_shader_core_properties", properties.extensionName) == 0) {
+                amd_shader_core_properties = true;
             } else if (strcmp("VK_AMD_shader_core_properties2", properties.extensionName) == 0) {
                 amd_shader_core_properties2 = true;
             } else if (strcmp("VK_EXT_pipeline_robustness", properties.extensionName) == 0) {
@@ -3689,6 +3709,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         vk::PhysicalDeviceSubgroupProperties subgroup_props;
         vk::PhysicalDeviceDriverProperties driver_props;
         vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV sm_props;
+        vk::PhysicalDeviceShaderCorePropertiesAMD amd_shader_core_properties_props;
         vk::PhysicalDeviceShaderCoreProperties2AMD amd_shader_core_properties2_props;
         vk::PhysicalDeviceVulkan11Properties vk11_props;
         vk::PhysicalDeviceVulkan12Properties vk12_props;
@@ -3710,6 +3731,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (sm_builtins) {
             last_struct->pNext = (VkBaseOutStructure *)&sm_props;
             last_struct = (VkBaseOutStructure *)&sm_props;
+        }
+        if (amd_shader_core_properties) {
+            last_struct->pNext = (VkBaseOutStructure *)&amd_shader_core_properties_props;
+            last_struct = (VkBaseOutStructure *)&amd_shader_core_properties_props;
         }
         if (amd_shader_core_properties2) {
             last_struct->pNext = (VkBaseOutStructure *)&amd_shader_core_properties2_props;
@@ -3764,6 +3789,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
             device->shader_core_count = amd_shader_core_properties2_props.activeComputeUnitCount;
+        } else if (amd_shader_core_properties) {
+            device->shader_core_count = amd_shader_core_properties_props.shaderEngineCount *
+                                        amd_shader_core_properties_props.shaderArraysPerEngineCount *
+                                        amd_shader_core_properties_props.computeUnitsPerShaderArray;
         } else {
             device->shader_core_count = 0;
         }
@@ -5513,16 +5542,28 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
         VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
-        // Copy device to device
-        ggml_vk_ensure_sync_staging_buffer(src->device, size);
-        ggml_vk_ensure_sync_staging_buffer(dst->device, size);
+        const bool src_host_direct = bool((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                                          (src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent));
+        const bool dst_host_direct = bool((dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) &&
+                                          (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent));
 
-        // Copy to src staging buffer
-        ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
-        // memcpy to dst staging buffer
-        memcpy(dst->device->sync_staging->ptr, src->device->sync_staging->ptr, size);
-        // Copy to dst buffer
-        ggml_vk_buffer_copy(dst, dst_offset, dst->device->sync_staging, 0, size);
+        const uint8_t *src_ptr = nullptr;
+
+        if (src_host_direct) {
+            src_ptr = static_cast<const uint8_t *>(src->ptr) + src_offset;
+        } else {
+            ggml_vk_ensure_sync_staging_buffer(src->device, size);
+            ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
+            src_ptr = static_cast<const uint8_t *>(src->device->sync_staging->ptr);
+        }
+
+        if (dst_host_direct) {
+            memcpy(static_cast<uint8_t *>(dst->ptr) + dst_offset, src_ptr, size);
+        } else {
+            ggml_vk_ensure_sync_staging_buffer(dst->device, size);
+            memcpy(static_cast<uint8_t *>(dst->device->sync_staging->ptr), src_ptr, size);
+            ggml_vk_buffer_copy(dst, dst_offset, dst->device->sync_staging, 0, size);
+        }
     }
 }
 
