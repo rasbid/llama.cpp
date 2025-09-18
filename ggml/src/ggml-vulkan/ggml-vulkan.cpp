@@ -11319,11 +11319,11 @@ static void ggml_vk_cleanup_device(ggml_vk_device_state & dev) {
 
     if (dev.fence) {
         dev.device->device.destroyFence(dev.fence);
-        dev.fence = {};
+        dev.fence = nullptr;
     }
     if (dev.almost_ready_fence) {
         dev.device->device.destroyFence(dev.almost_ready_fence);
-        dev.almost_ready_fence = {};
+        dev.almost_ready_fence = nullptr;
     }
 
     for (auto& pool : dev.descriptor_pools) {
