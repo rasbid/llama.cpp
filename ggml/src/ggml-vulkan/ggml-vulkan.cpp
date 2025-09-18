@@ -1345,24 +1345,31 @@ class vk_perf_logger {
     std::map<std::string, std::vector<uint64_t>> flops;
 };
 
-struct ggml_backend_vk_context {
-    std::string name;
-
+struct ggml_vk_device_state {
     vk_device device;
 
-    size_t semaphore_idx, event_idx;
+    size_t semaphore_idx = 0;
+    size_t event_idx = 0;
     ggml_vk_garbage_collector gc;
-    size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
-    vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials;
-    vk::Fence fence, almost_ready_fence;
-    bool almost_ready_fence_pending {};
+    size_t prealloc_size_x = 0;
+    size_t prealloc_size_y = 0;
+    size_t prealloc_size_split_k = 0;
+    size_t prealloc_size_add_rms_partials = 0;
+    size_t prealloc_size_add_rms_partials_offset = 0;
+    vk_buffer prealloc_x;
+    vk_buffer prealloc_y;
+    vk_buffer prealloc_split_k;
+    vk_buffer prealloc_add_rms_partials;
+    vk::Fence fence;
+    vk::Fence almost_ready_fence;
+    bool almost_ready_fence_pending = false;
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
-    bool do_add_rms_partials;
+    bool do_add_rms_partials = false;
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
-    vk_pipeline_struct * prealloc_y_last_pipeline_used {};
-    const ggml_tensor * prealloc_y_last_tensor_used {};
+    vk_pipeline_struct * prealloc_y_last_pipeline_used = nullptr;
+    const ggml_tensor * prealloc_y_last_tensor_used = nullptr;
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
@@ -1370,9 +1377,11 @@ struct ggml_backend_vk_context {
     // Track which prealloc buffers have pending reads that need to be synchronized.
     // These are checked before writing to the buffer (and call ggml_vk_sync_buffers if set),
     // and set to true after the buffer contents are consumed.
-    bool prealloc_x_need_sync, prealloc_y_need_sync, prealloc_split_k_need_sync;
+    bool prealloc_x_need_sync = false;
+    bool prealloc_y_need_sync = false;
+    bool prealloc_split_k_need_sync = false;
 
-    vk_buffer buffer_pool[MAX_VK_BUFFERS];
+    vk_buffer buffer_pool[MAX_VK_BUFFERS] = {};
 
     vk_context_ref compute_ctx;
     vk_context_ref transfer_ctx;
@@ -1381,11 +1390,18 @@ struct ggml_backend_vk_context {
 
     std::vector<vk::DescriptorPool> descriptor_pools;
     std::vector<vk::DescriptorSet> descriptor_sets;
-    uint32_t descriptor_set_idx {};
-    uint32_t pipeline_descriptor_set_requirements {};
+    uint32_t descriptor_set_idx = 0;
+    uint32_t pipeline_descriptor_set_requirements = 0;
 
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
+};
+
+struct ggml_backend_vk_context : ggml_vk_device_state {
+    std::string name;
+
+    std::vector<std::unique_ptr<ggml_vk_device_state>> devices;
+    size_t active_device = 0;
 
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
@@ -1487,18 +1503,18 @@ typedef void (*ggml_vk_func_t)(ggml_backend_vk_context * ctx, vk_context& subctx
 static void ggml_backend_vk_free(ggml_backend_t backend);
 
 // Wait for ctx->fence to be signaled.
-static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
+static void ggml_vk_wait_for_fence(ggml_vk_device_state & dev) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
-    if (ctx->almost_ready_fence_pending) {
-        VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence");
-        ctx->device->device.resetFences({ ctx->almost_ready_fence });
-        ctx->almost_ready_fence_pending = false;
+    if (dev.almost_ready_fence_pending) {
+        VK_CHECK(dev.device->device.waitForFences({ dev.almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence");
+        dev.device->device.resetFences({ dev.almost_ready_fence });
+        dev.almost_ready_fence_pending = false;
     }
 
     // Spin (w/pause) waiting for the graph to finish executing.
     vk::Result result;
-    while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
+    while ((result = dev.device->device.getFenceStatus(dev.fence)) != vk::Result::eSuccess) {
         if (result != vk::Result::eNotReady) {
             fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
             exit(1);
@@ -1516,7 +1532,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
             YIELD();
         }
     }
-    ctx->device->device.resetFences({ ctx->fence });
+    dev.device->device.resetFences({ dev.fence });
 }
 
 // variables to track number of compiles in progress
@@ -4647,6 +4663,51 @@ static void ggml_vk_instance_init() {
     }
 }
 
+static void ggml_vk_init_device_state(ggml_vk_device_state & dev, size_t idx) {
+    dev.device = ggml_vk_get_device(idx);
+
+    dev.semaphore_idx = 0;
+    dev.event_idx = 0;
+    dev.gc = {};
+    dev.prealloc_size_x = 0;
+    dev.prealloc_size_y = 0;
+    dev.prealloc_size_split_k = 0;
+    dev.prealloc_size_add_rms_partials = 0;
+    dev.prealloc_size_add_rms_partials_offset = 0;
+    dev.prealloc_x.reset();
+    dev.prealloc_y.reset();
+    dev.prealloc_split_k.reset();
+    dev.prealloc_add_rms_partials.reset();
+    dev.fence = dev.device->device.createFence({});
+    dev.almost_ready_fence = dev.device->device.createFence({});
+    dev.almost_ready_fence_pending = false;
+    dev.do_add_rms_partials = false;
+    dev.prealloc_y_last_pipeline_used = nullptr;
+    dev.prealloc_y_last_tensor_used = nullptr;
+    dev.unsynced_nodes_written.clear();
+    dev.unsynced_nodes_read.clear();
+    dev.prealloc_x_need_sync = false;
+    dev.prealloc_y_need_sync = false;
+    dev.prealloc_split_k_need_sync = false;
+    for (auto & buffer : dev.buffer_pool) {
+        buffer.reset();
+    }
+    dev.compute_ctx.reset();
+    dev.transfer_ctx.reset();
+    dev.tensor_ctxs.clear();
+    dev.gc.contexts.clear();
+    dev.gc.temp_buffers.clear();
+    dev.gc.semaphores.clear();
+    dev.gc.tl_semaphores.clear();
+    dev.gc.events.clear();
+    dev.descriptor_pools.clear();
+    dev.descriptor_sets.clear();
+    dev.descriptor_set_idx = 0;
+    dev.pipeline_descriptor_set_requirements = 0;
+    dev.compute_cmd_pool.init(dev.device, &dev.device->compute_queue);
+    dev.transfer_cmd_pool.init(dev.device, &dev.device->transfer_queue);
+}
+
 static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     VK_LOG_DEBUG("ggml_vk_init(" << ctx->name << ", " << idx << ")");
     ggml_vk_instance_init();
@@ -4654,20 +4715,9 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
 
     ctx->name = GGML_VK_NAME + std::to_string(idx);
 
-    ctx->device = ggml_vk_get_device(idx);
-
-    ctx->semaphore_idx = 0;
-    ctx->event_idx = 0;
-
-    ctx->prealloc_size_x = 0;
-    ctx->prealloc_size_y = 0;
-    ctx->prealloc_size_split_k = 0;
-
-    ctx->fence = ctx->device->device.createFence({});
-    ctx->almost_ready_fence = ctx->device->device.createFence({});
-
-    ctx->compute_cmd_pool.init(ctx->device, &ctx->device->compute_queue);
-    ctx->transfer_cmd_pool.init(ctx->device, &ctx->device->transfer_queue);
+    ggml_vk_init_device_state(*ctx, idx);
+    ctx->devices.clear();
+    ctx->active_device = 0;
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
     const char* skip_checks = getenv("GGML_VULKAN_SKIP_CHECKS");
@@ -4962,7 +5012,7 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[a_type];
 }
 
-static vk_buffer ggml_vk_pool_malloc(ggml_backend_vk_context * ctx, size_t size) {
+static vk_buffer ggml_vk_pool_malloc(ggml_vk_device_state & dev, size_t size) {
     VK_LOG_DEBUG("ggml_vk_pool_malloc(" << size << ")");
     VK_LOG_MEMORY("ggml_vk_pool_malloc");
 
@@ -4971,7 +5021,7 @@ static vk_buffer ggml_vk_pool_malloc(ggml_backend_vk_context * ctx, size_t size)
     int worst_i = -1;
     size_t worst_size = 0; //largest unused buffer seen so far
     for (int i = 0; i < MAX_VK_BUFFERS; ++i) {
-        vk_buffer &b = ctx->buffer_pool[i];
+        vk_buffer &b = dev.buffer_pool[i];
         if (b != nullptr && b->size >= size && b->size < best_size) {
             best_i = i;
             best_size = b->size;
@@ -4983,23 +5033,23 @@ static vk_buffer ggml_vk_pool_malloc(ggml_backend_vk_context * ctx, size_t size)
     }
     if(best_i != -1) {
         //found the smallest buffer that fits our needs
-        vk_buffer b = ctx->buffer_pool[best_i];
-        ctx->buffer_pool[best_i].reset();
+        vk_buffer b = dev.buffer_pool[best_i];
+        dev.buffer_pool[best_i].reset();
         return b;
     }
     if(worst_i != -1) {
         //no buffer that fits our needs, resize largest one to save memory
-        vk_buffer& b = ctx->buffer_pool[worst_i];
+        vk_buffer& b = dev.buffer_pool[worst_i];
         ggml_vk_destroy_buffer(b);
     }
 
-    return ggml_vk_create_buffer_device(ctx->device, size);
+    return ggml_vk_create_buffer_device(dev.device, size);
 }
 
-static void ggml_vk_pool_free(ggml_backend_vk_context * ctx, vk_buffer& buffer) {
+static void ggml_vk_pool_free(ggml_vk_device_state & dev, vk_buffer& buffer) {
     VK_LOG_DEBUG("ggml_vk_pool_free(" << buffer->size << ")");
     for (int i = 0; i < MAX_VK_BUFFERS; ++i) {
-        vk_buffer& b = ctx->buffer_pool[i];
+        vk_buffer& b = dev.buffer_pool[i];
         if (b == nullptr) {
             b = buffer;
             return;
@@ -5010,9 +5060,9 @@ static void ggml_vk_pool_free(ggml_backend_vk_context * ctx, vk_buffer& buffer) 
 }
 
 // Returns an available temporary buffer that may only be used temporarily, it will be reused
-static vk_buffer ggml_vk_create_buffer_temp(ggml_backend_vk_context * ctx, size_t size) {
+static vk_buffer ggml_vk_create_buffer_temp(ggml_vk_device_state & dev, size_t size) {
     // Try to find existing temp buffer with enough capacity
-    for (auto& buffer : ctx->gc.temp_buffers) {
+    for (auto& buffer : dev.gc.temp_buffers) {
         if (buffer->size >= size) {
             return buffer;
         }
@@ -5021,8 +5071,8 @@ static vk_buffer ggml_vk_create_buffer_temp(ggml_backend_vk_context * ctx, size_
     VK_LOG_MEMORY("ggml_vk_create_buffer_temp(" << size << ")");
 
     // Otherwise create new buffer
-    vk_buffer buf = ggml_vk_pool_malloc(ctx, size);
-    ctx->gc.temp_buffers.push_back(buf);
+    vk_buffer buf = ggml_vk_pool_malloc(dev, size);
+    dev.gc.temp_buffers.push_back(buf);
 
     return buf;
 }
@@ -11177,7 +11227,7 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         }
 
         if (use_fence) {
-            ggml_vk_wait_for_fence(ctx);
+            ggml_vk_wait_for_fence(*ctx);
         }
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_check_results_1(ctx, cgraph, tensor_idx);
@@ -11197,78 +11247,108 @@ static bool ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 }
 
 // Clean up after graph processing is done
+static void ggml_vk_graph_cleanup_device(ggml_vk_device_state & dev) {
+    VK_LOG_DEBUG("ggml_vk_graph_cleanup_device()");
+    for (auto& buffer : dev.gc.temp_buffers) {
+        ggml_vk_pool_free(dev, buffer);
+    }
+    dev.gc.temp_buffers.clear();
+    dev.prealloc_y_last_pipeline_used = nullptr;
+
+    dev.unsynced_nodes_written.clear();
+    dev.unsynced_nodes_read.clear();
+    dev.prealloc_x_need_sync = dev.prealloc_y_need_sync = dev.prealloc_split_k_need_sync = false;
+
+    ggml_vk_command_pool_cleanup(dev.device, dev.compute_cmd_pool);
+    ggml_vk_command_pool_cleanup(dev.device, dev.transfer_cmd_pool);
+
+    for (size_t i = 0; i < dev.gc.semaphores.size(); i++) {
+        dev.device->device.destroySemaphore({ dev.gc.semaphores[i].s });
+    }
+    dev.gc.semaphores.clear();
+
+    for (size_t i = 0; i < dev.gc.tl_semaphores.size(); i++) {
+        dev.device->device.destroySemaphore({ dev.gc.tl_semaphores[i].s });
+    }
+    dev.gc.tl_semaphores.clear();
+    dev.semaphore_idx = 0;
+
+    dev.event_idx = 0;
+
+    for (auto& event : dev.gc.events) {
+        dev.device->device.resetEvent(event);
+    }
+
+    dev.tensor_ctxs.clear();
+    dev.gc.contexts.clear();
+    dev.pipeline_descriptor_set_requirements = 0;
+    dev.descriptor_set_idx = 0;
+}
+
 static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_graph_cleanup()");
-    for (auto& buffer : ctx->gc.temp_buffers) {
-        ggml_vk_pool_free(ctx, buffer);
+    ggml_vk_graph_cleanup_device(*ctx);
+    for (auto & extra : ctx->devices) {
+        ggml_vk_graph_cleanup_device(*extra);
     }
-    ctx->gc.temp_buffers.clear();
-    ctx->prealloc_y_last_pipeline_used = {};
+}
 
-    ctx->unsynced_nodes_written.clear();
-    ctx->unsynced_nodes_read.clear();
-    ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+static void ggml_vk_cleanup_device(ggml_vk_device_state & dev) {
+    ggml_vk_graph_cleanup_device(dev);
 
-    ggml_vk_command_pool_cleanup(ctx->device, ctx->compute_cmd_pool);
-    ggml_vk_command_pool_cleanup(ctx->device, ctx->transfer_cmd_pool);
+    ggml_vk_destroy_buffer(dev.prealloc_x);
+    ggml_vk_destroy_buffer(dev.prealloc_y);
+    ggml_vk_destroy_buffer(dev.prealloc_split_k);
+    ggml_vk_destroy_buffer(dev.prealloc_add_rms_partials);
+    dev.prealloc_y_last_pipeline_used = nullptr;
 
-    for (size_t i = 0; i < ctx->gc.semaphores.size(); i++) {
-        ctx->device->device.destroySemaphore({ ctx->gc.semaphores[i].s });
-    }
-    ctx->gc.semaphores.clear();
-
-    for (size_t i = 0; i < ctx->gc.tl_semaphores.size(); i++) {
-        ctx->device->device.destroySemaphore({ ctx->gc.tl_semaphores[i].s });
-    }
-    ctx->gc.tl_semaphores.clear();
-    ctx->semaphore_idx = 0;
-
-    ctx->event_idx = 0;
-
-    for (auto& event : ctx->gc.events) {
-        ctx->device->device.resetEvent(event);
+    for (auto& buffer : dev.buffer_pool) {
+        ggml_vk_destroy_buffer(buffer);
     }
 
-    ctx->tensor_ctxs.clear();
-    ctx->gc.contexts.clear();
-    ctx->pipeline_descriptor_set_requirements = 0;
-    ctx->descriptor_set_idx = 0;
+    dev.prealloc_size_x = 0;
+    dev.prealloc_size_y = 0;
+    dev.prealloc_size_split_k = 0;
+    dev.prealloc_size_add_rms_partials = 0;
+    dev.prealloc_size_add_rms_partials_offset = 0;
+
+    for (auto& event : dev.gc.events) {
+        dev.device->device.destroyEvent(event);
+    }
+    dev.gc.events.clear();
+
+    if (dev.fence) {
+        dev.device->device.destroyFence(dev.fence);
+        dev.fence = {};
+    }
+    if (dev.almost_ready_fence) {
+        dev.device->device.destroyFence(dev.almost_ready_fence);
+        dev.almost_ready_fence = {};
+    }
+
+    for (auto& pool : dev.descriptor_pools) {
+        dev.device->device.destroyDescriptorPool(pool);
+    }
+    dev.descriptor_pools.clear();
+    dev.descriptor_sets.clear();
+
+    dev.compute_cmd_pool.destroy(dev.device->device);
+    dev.transfer_cmd_pool.destroy(dev.device->device);
+    dev.compute_ctx.reset();
+    dev.transfer_ctx.reset();
+    dev.almost_ready_fence_pending = false;
+    dev.do_add_rms_partials = false;
 }
 
 // Clean up on backend free
 static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
-    ggml_vk_graph_cleanup(ctx);
-
-    ggml_vk_destroy_buffer(ctx->prealloc_x);
-    ggml_vk_destroy_buffer(ctx->prealloc_y);
-    ggml_vk_destroy_buffer(ctx->prealloc_split_k);
-    ctx->prealloc_y_last_pipeline_used = nullptr;
-
-    for (auto& buffer : ctx->buffer_pool) {
-        ggml_vk_destroy_buffer(buffer);
+    ggml_vk_cleanup_device(*ctx);
+    for (auto & extra : ctx->devices) {
+        ggml_vk_cleanup_device(*extra);
     }
-
-    ctx->prealloc_size_x = 0;
-    ctx->prealloc_size_y = 0;
-    ctx->prealloc_size_split_k = 0;
-
-    for (auto& event : ctx->gc.events) {
-        ctx->device->device.destroyEvent(event);
-    }
-    ctx->gc.events.clear();
-
-    ctx->device->device.destroyFence(ctx->fence);
-    ctx->device->device.destroyFence(ctx->almost_ready_fence);
-
-    for (auto& pool : ctx->descriptor_pools) {
-        ctx->device->device.destroyDescriptorPool(pool);
-    }
-    ctx->descriptor_pools.clear();
-    ctx->descriptor_sets.clear();
-
-    ctx->compute_cmd_pool.destroy(ctx->device->device);
-    ctx->transfer_cmd_pool.destroy(ctx->device->device);
+    ctx->devices.clear();
+    ctx->active_device = 0;
 }
 
 static int ggml_vk_get_device_count() {
@@ -11620,7 +11700,7 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     }
 
     ggml_vk_submit(transfer_ctx, ctx->fence);
-    ggml_vk_wait_for_fence(ctx);
+    ggml_vk_wait_for_fence(*ctx);
 
     for (auto& cpy : transfer_ctx->out_memcpys) {
         memcpy(cpy.dst, cpy.src, cpy.n);
