@@ -925,6 +925,9 @@ bool llama_model_loader::load_all_data(
         void * progress_callback_user_data) {
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    LLAMA_LOG_INFO("%s: begin weight streaming (%d tensors, %zu total bytes, use_mmap=%s, check_tensors=%s, buffers=%zu)\n",
+        __func__, n_tensors, size_data, use_mmap ? "true" : "false", check_tensors ? "true" : "false", bufs.size());
+
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
@@ -1024,13 +1027,31 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
+        const char * tensor_name  = ggml_get_name(cur);
+        const char * tensor_type  = ggml_type_name(cur->type);
+        const std::string tensor_shape = llama_format_tensor_shape(cur);
+        const size_t tensor_size = ggml_nbytes(cur);
+        ggml_backend_buffer_type_t cur_buft = cur->buffer ? ggml_backend_buffer_get_type(cur->buffer) : nullptr;
+        const char * buf_type_name = cur_buft ? ggml_backend_buft_name(cur_buft) : "(none)";
+        const bool buffer_is_host = !cur->buffer || ggml_backend_buffer_is_host(cur->buffer);
+        ggml_backend_dev_t tensor_dev = nullptr;
+        if (cur_buft) {
+            tensor_dev = ggml_backend_buft_get_device(cur_buft);
+        }
+        const char * tensor_dev_name = tensor_dev ? ggml_backend_dev_name(tensor_dev) : (buffer_is_host ? "host" : "unknown");
+
+        LLAMA_LOG_INFO(
+            "%s: tensor '%s' (%s %s, %zu bytes) file[%u]@%zu -> buffer type %s (%s) on %s\n",
+            __func__, tensor_name, tensor_type, tensor_shape.c_str(), tensor_size, weight->idx, weight->offs,
+            buf_type_name, buffer_is_host ? "host" : "device", tensor_dev_name);
+
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
                 return false;
             }
         }
 
-        size_t n_size = ggml_nbytes(cur);
+        size_t n_size = tensor_size;
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1076,19 +1097,32 @@ bool llama_model_loader::load_all_data(
                     file->seek(weight->offs, SEEK_SET);
 
                     size_t bytes_read = 0;
+                    const size_t chunk_count = (n_size + buffer_size - 1) / buffer_size;
+                    LLAMA_LOG_INFO(
+                        "%s: tensor '%s' async upload via %s (%zu chunks, chunk size %zu)\n",
+                        __func__, tensor_name, ggml_backend_name(upload_backend), chunk_count, buffer_size);
 
                     while (bytes_read < n_size) {
                         size_t read_iteration = std::min<size_t>(buffer_size, n_size - bytes_read);
 
-                        ggml_backend_event_synchronize(events[buffer_idx]);
-                        file->read_raw(host_ptrs[buffer_idx], read_iteration);
-                        ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[buffer_idx], bytes_read, read_iteration);
-                        ggml_backend_event_record(events[buffer_idx], upload_backend);
+                        const size_t staging_idx = buffer_idx;
+                        LLAMA_LOG_DEBUG("%s: tensor '%s' waiting for staging buffer %zu\n",
+                            __func__, tensor_name, staging_idx);
+                        ggml_backend_event_synchronize(events[staging_idx]);
+                        LLAMA_LOG_DEBUG("%s: tensor '%s' staging buffer %zu ready, reading %zu bytes (offset %zu/%zu)\n",
+                            __func__, tensor_name, staging_idx, read_iteration, bytes_read, n_size);
+                        file->read_raw(host_ptrs[staging_idx], read_iteration);
+                        ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[staging_idx], bytes_read, read_iteration);
+                        ggml_backend_event_record(events[staging_idx], upload_backend);
+                        LLAMA_LOG_DEBUG("%s: tensor '%s' submitted chunk %zu/%zu (%zu bytes) via staging buffer %zu\n",
+                            __func__, tensor_name, (bytes_read / buffer_size) + 1, chunk_count, read_iteration, staging_idx);
 
                         bytes_read += read_iteration;
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
+                    LLAMA_LOG_INFO("%s: tensor '%s' async upload complete (%zu bytes)\n",
+                        __func__, tensor_name, n_size);
                 } else {
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
@@ -1097,11 +1131,17 @@ bool llama_model_loader::load_all_data(
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
+                    LLAMA_LOG_INFO("%s: tensor '%s' synchronous upload to device buffer complete (%zu bytes)\n",
+                        __func__, tensor_name, n_size);
                 }
             }
         }
 
         size_done += n_size;
+        LLAMA_LOG_DEBUG("%s: cumulative load progress %.2f%% (%zu/%zu bytes)\n",
+            __func__, 100.0f * size_done / size_data, size_done, size_data);
+        LLAMA_LOG_INFO("%s: tensor '%s' load complete (cumulative %.2f%%)\n",
+            __func__, tensor_name, 100.0f * size_done / size_data);
     }
 
     // free temporary resources used for async uploads

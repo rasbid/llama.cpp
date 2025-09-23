@@ -86,11 +86,21 @@ static void sigint_handler(int signo) {
 int main(int argc, char ** argv) {
     common_params params;
     g_params = &params;
+    LOG_INF("llama-cli: parsing command line arguments\n");
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_MAIN, print_usage)) {
         return 1;
     }
 
     common_init();
+
+    LOG_INF("llama-cli: initialization complete, preparing backend\n");
+
+    if (!params.model.path.empty()) {
+        LOG_INF("llama-cli: model path '%s' (alias: '%s')\n",
+                params.model.path.c_str(), params.model_alias.c_str());
+    }
+    LOG_INF("llama-cli: target context %d, batch %d, ubatch %d, gpu layers %d\n",
+            params.n_ctx, params.n_batch, params.n_ubatch, params.n_gpu_layers);
 
     auto & sparams = params.sampling;
 
@@ -123,7 +133,10 @@ int main(int argc, char ** argv) {
     LOG_INF("%s: llama backend init\n", __func__);
 
     llama_backend_init();
+    LOG_INF("%s: llama backend initialized\n", __func__);
+
     llama_numa_init(params.numa);
+    LOG_INF("%s: NUMA strategy applied: %d\n", __func__, (int) params.numa);
 
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
@@ -142,15 +155,22 @@ int main(int argc, char ** argv) {
     model = llama_init.model.get();
     ctx = llama_init.context.get();
 
+    LOG_INF("%s: common_init_from_params returned (model ptr: %p, ctx ptr: %p)\n",
+            __func__, static_cast<void *>(model), static_cast<void *>(ctx));
+
     if (model == NULL) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
         return 1;
     }
 
     auto * mem = llama_get_memory(ctx);
+    LOG_INF("%s: llama memory subsystem ready (%p)\n", __func__, static_cast<void *>(mem));
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
     auto chat_templates = common_chat_templates_init(model, params.chat_template);
+
+    LOG_INF("%s: chat templates initialized (%s)\n",
+            __func__, chat_templates ? "available" : "none");
 
     LOG_INF("%s: llama threadpool init, n_threads = %d\n", __func__, (int) params.cpuparams.n_threads);
 
@@ -172,6 +192,8 @@ int main(int argc, char ** argv) {
 
     struct ggml_threadpool * threadpool_batch = NULL;
     if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+        LOG_INF("%s: creating batch threadpool with %d threads (paused=%d)\n",
+                __func__, tpp_batch.n_threads, tpp_batch.paused);
         threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
         if (!threadpool_batch) {
             LOG_ERR("%s: batch threadpool create failed : n_threads %d\n", __func__, tpp_batch.n_threads);
@@ -182,6 +204,8 @@ int main(int argc, char ** argv) {
         tpp.paused = true;
     }
 
+    LOG_INF("%s: creating main threadpool with %d threads (paused=%d)\n",
+            __func__, tpp.n_threads, tpp.paused);
     struct ggml_threadpool * threadpool = ggml_threadpool_new_fn(&tpp);
     if (!threadpool) {
         LOG_ERR("%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
@@ -189,6 +213,7 @@ int main(int argc, char ** argv) {
     }
 
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
+    LOG_INF("%s: threadpools attached to llama context\n", __func__);
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
     const int n_ctx = llama_n_ctx(ctx);
