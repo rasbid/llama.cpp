@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "ggml-backend.h"
 
 #include "common.h"
 #include "log.h"
@@ -899,6 +900,28 @@ struct common_init_result common_init_from_params(common_params & params) {
     common_init_result iparams;
     auto mparams = common_model_params_to_llama(params);
 
+    LOG_INF("%s: begin model initialization (path: '%s')\n", __func__, params.model.path.c_str());
+    LOG_INF("%s: requested context %d, batch %d, ubatch %d, parallel %d\n",
+            __func__, params.n_ctx, params.n_batch, params.n_ubatch, params.n_parallel);
+    LOG_INF("%s: GPU layers: %d, main GPU: %d, split mode: %d\n",
+            __func__, params.n_gpu_layers, params.main_gpu, (int) params.split_mode);
+
+    if (!params.devices.empty()) {
+        for (size_t i = 0; i < params.devices.size(); ++i) {
+            ggml_backend_dev_t dev = params.devices[i];
+            LOG_INF("%s: offload device[%zu]: %s (%s)\n",
+                    __func__, i,
+                    ggml_backend_dev_name(dev),
+                    ggml_backend_dev_description(dev));
+        }
+    } else {
+        LOG_INF("%s: no explicit offload devices configured (default device selection applies)\n", __func__);
+    }
+
+    if (!params.lora_adapters.empty()) {
+        LOG_INF("%s: %zu LoRA adapter(s) requested\n", __func__, params.lora_adapters.size());
+    }
+
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         LOG_ERR("%s: failed to load model '%s', try reducing --n-gpu-layers if you're running out of VRAM\n",
@@ -906,9 +929,18 @@ struct common_init_result common_init_from_params(common_params & params) {
         return iparams;
     }
 
+    {
+        char model_desc[512] = {0};
+        llama_model_desc(model, model_desc, sizeof(model_desc));
+        LOG_INF("%s: model loaded successfully: %s\n", __func__, model_desc);
+    }
+
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     auto cparams = common_context_params_to_llama(params);
+
+    LOG_INF("%s: creating context with %d threads (%d batch threads)\n",
+            __func__, cparams.n_threads, cparams.n_threads_batch);
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
@@ -918,12 +950,25 @@ struct common_init_result common_init_from_params(common_params & params) {
         return iparams;
     }
 
+    LOG_INF("%s: context created (ctx size: %d, batch size: %d, sequence max: %d)\n",
+            __func__, llama_n_ctx(lctx), cparams.n_batch, cparams.n_seq_max);
+
+    if (llama_model_has_encoder(model)) {
+        LOG_INF("%s: encoder component detected in model\n", __func__);
+    }
+    if (llama_model_has_decoder(model)) {
+        LOG_INF("%s: decoder component detected in model\n", __func__);
+    }
+
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
         params.ctx_shift = false;
     }
 
     if (!params.control_vectors.empty()) {
+        LOG_INF("%s: loading %zu control vector(s) (layers %d -> %d)\n",
+                __func__, params.control_vectors.size(),
+                params.control_vector_layer_start, params.control_vector_layer_end);
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
 
@@ -981,6 +1026,8 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
+        LOG_INF("%s: initializing LoRA adapter '%s' (scale %.3f)\n",
+                __func__, la.path.c_str(), la.scale);
         llama_adapter_lora_ptr lora;
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
@@ -1000,6 +1047,8 @@ struct common_init_result common_init_from_params(common_params & params) {
     }
 
     if (!params.lora_init_without_apply) {
+        LOG_INF("%s: applying active LoRA adapters (%zu)\n",
+                __func__, params.lora_adapters.size());
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
@@ -1073,6 +1122,8 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     iparams.model.reset(model);
     iparams.context.reset(lctx);
+
+    LOG_INF("%s: model initialization complete\n", __func__);
 
     return iparams;
 }
