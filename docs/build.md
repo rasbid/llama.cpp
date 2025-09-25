@@ -413,6 +413,27 @@ Finally, after finishing your build, you should be able to do something like thi
 # ggml_vulkan: Using Intel(R) Graphics (ADL GT2) | uma: 1 | fp16: 1 | warp size: 32
 ```
 
+#### Targeting AMD GCN (GFX8/Polaris) Vulkan devices
+
+Older AMD GPUs such as the RX 580 expose fast FP32 wave64 execution but lack
+cooperative-matrix, integer-dot and bfloat16 shader support. You can avoid
+building unusable shader families by forcing their GLSL compiler probes off
+when configuring CMake:
+
+```bash
+cmake -B build-gfx803 -DGGML_VULKAN=ON \
+      -DGGML_VULKAN_FORCE_COOPMAT_GLSLC_SUPPORT=OFF \
+      -DGGML_VULKAN_FORCE_COOPMAT2_GLSLC_SUPPORT=OFF \
+      -DGGML_VULKAN_FORCE_INTEGER_DOT_GLSLC_SUPPORT=OFF \
+      -DGGML_VULKAN_FORCE_BFLOAT16_GLSLC_SUPPORT=OFF
+cmake --build build-gfx803 --config Release
+```
+
+At runtime, keep execution on the FP32-oriented code paths by exporting
+`GGML_VK_DISABLE_F16=1`. Polaris-class GPUs also benefit from the existing
+`GGML_VK_FORCE_MMVQ=1` flag when profiling shows that matrix–matrix–vector
+quantization remains faster than the fallback kernels.
+
 ## CANN
 This provides NPU acceleration using the AI cores of your Ascend NPU. And [CANN](https://www.hiascend.com/en/software/cann) is a hierarchical APIs to help you to quickly build AI applications and service based on Ascend NPU.
 
