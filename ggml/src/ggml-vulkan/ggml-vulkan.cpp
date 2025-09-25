@@ -257,30 +257,58 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             }
         }
 
-        if (!amd_shader_core_properties || !integer_dot_product || !subgroup_size_control) {
+        if (!amd_shader_core_properties) {
             return vk_device_architecture::OTHER;
         }
 
         vk::PhysicalDeviceProperties2 props2;
         vk::PhysicalDeviceShaderCorePropertiesAMD shader_core_props_amd;
-        vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR integer_dot_props;
-        vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_size_control_props;
+        vk::PhysicalDeviceSubgroupProperties subgroup_props;
 
+        shader_core_props_amd.pNext = &subgroup_props;
+        subgroup_props.pNext = nullptr;
         props2.pNext = &shader_core_props_amd;
-        shader_core_props_amd.pNext = &integer_dot_props;
-        integer_dot_props.pNext = &subgroup_size_control_props;
 
         device.getProperties2(&props2);
 
-        if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 64) {
+        uint32_t max_subgroup_size = subgroup_props.subgroupSize;
+
+        if (subgroup_size_control) {
+            vk::PhysicalDeviceProperties2 subgroup_size_props;
+            vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_size_control_props;
+
+            subgroup_size_control_props.pNext = nullptr;
+            subgroup_size_props.pNext = &subgroup_size_control_props;
+
+            device.getProperties2(&subgroup_size_props);
+
+            max_subgroup_size = subgroup_size_control_props.maxSubgroupSize;
+        }
+
+        bool integer_dot_mixed_signedness = false;
+        if (integer_dot_product) {
+            vk::PhysicalDeviceProperties2 integer_dot_props2;
+            vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR integer_dot_props;
+
+            integer_dot_props.pNext = nullptr;
+            integer_dot_props2.pNext = &integer_dot_props;
+
+            device.getProperties2(&integer_dot_props2);
+
+            integer_dot_mixed_signedness = integer_dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated;
+        }
+
+        const uint32_t wavefront_size = shader_core_props_amd.wavefrontSize;
+
+        if (wavefront_size == 64 && max_subgroup_size >= 64) {
             return vk_device_architecture::AMD_GCN;
         }
-        if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 32) {
-            // RDNA
+
+        if (wavefront_size == 32) {
             if (shader_core_props_amd.wavefrontsPerSimd == 20) {
                 return vk_device_architecture::AMD_RDNA1;
             }
-            if (integer_dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated) {
+            if (integer_dot_mixed_signedness) {
                 return vk_device_architecture::AMD_RDNA3;
             }
             return vk_device_architecture::AMD_RDNA2;

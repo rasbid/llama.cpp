@@ -3,6 +3,40 @@ cmake_policy(SET CMP0114 NEW)
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
 
+set(GGML_VULKAN_FORCE_COOPMAT_GLSLC_SUPPORT "" CACHE STRING "Force GL_KHR_cooperative_matrix GLSL compiler support detection (use ON, OFF, or leave empty for auto)")
+set(GGML_VULKAN_FORCE_COOPMAT2_GLSLC_SUPPORT "" CACHE STRING "Force GL_NV_cooperative_matrix2 GLSL compiler support detection (use ON, OFF, or leave empty for auto)")
+set(GGML_VULKAN_FORCE_INTEGER_DOT_GLSLC_SUPPORT "" CACHE STRING "Force GL_EXT_integer_dot_product GLSL compiler support detection (use ON, OFF, or leave empty for auto)")
+set(GGML_VULKAN_FORCE_BFLOAT16_GLSLC_SUPPORT "" CACHE STRING "Force GL_EXT_bfloat16 GLSL compiler support detection (use ON, OFF, or leave empty for auto)")
+
+mark_as_advanced(
+    GGML_VULKAN_FORCE_COOPMAT_GLSLC_SUPPORT
+    GGML_VULKAN_FORCE_COOPMAT2_GLSLC_SUPPORT
+    GGML_VULKAN_FORCE_INTEGER_DOT_GLSLC_SUPPORT
+    GGML_VULKAN_FORCE_BFLOAT16_GLSLC_SUPPORT
+)
+
+function(handle_forced_shader_extension EXTENSION_NAME RESULT_VARIABLE FORCE_VARIABLE)
+    if (NOT "${${FORCE_VARIABLE}}" STREQUAL "")
+        string(TOUPPER "${${FORCE_VARIABLE}}" FORCE_VALUE_UPPER)
+        if (FORCE_VALUE_UPPER STREQUAL "ON")
+            message(STATUS "${EXTENSION_NAME} support forced ON")
+            set(${RESULT_VARIABLE} ON)
+            add_compile_definitions(${RESULT_VARIABLE})
+            list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -D${RESULT_VARIABLE}=ON)
+            set(VULKAN_SHADER_GEN_CMAKE_ARGS "${VULKAN_SHADER_GEN_CMAKE_ARGS}" PARENT_SCOPE)
+            set(${RESULT_VARIABLE} ON PARENT_SCOPE)
+            return()
+        elseif (FORCE_VALUE_UPPER STREQUAL "OFF")
+            message(STATUS "${EXTENSION_NAME} support forced OFF")
+            set(${RESULT_VARIABLE} OFF)
+            set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
+            return()
+        else()
+            message(FATAL_ERROR "Invalid value for ${FORCE_VARIABLE}: ${${FORCE_VARIABLE}}. Expected ON, OFF, or empty.")
+        endif()
+    endif()
+endfunction()
+
 function(detect_host_compiler)
     if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
         find_program(HOST_C_COMPILER NAMES cl gcc clang NO_CMAKE_FIND_ROOT_PATH)
@@ -52,29 +86,61 @@ if (Vulkan_FOUND)
     set(VULKAN_SHADER_GEN_CMAKE_ARGS "")
 
     # Test all shader extensions
-    test_shader_extension_support(
-        "GL_KHR_cooperative_matrix"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_coopmat_support.comp"
-        "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
-    )
+    if (NOT "${GGML_VULKAN_FORCE_COOPMAT_GLSLC_SUPPORT}" MATCHES "^(|[Aa][Uu][Tt][Oo])$")
+        handle_forced_shader_extension(
+            "GL_KHR_cooperative_matrix"
+            "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
+            "GGML_VULKAN_FORCE_COOPMAT_GLSLC_SUPPORT"
+        )
+    else()
+        test_shader_extension_support(
+            "GL_KHR_cooperative_matrix"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_coopmat_support.comp"
+            "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
+        )
+    endif()
 
-    test_shader_extension_support(
-        "GL_NV_cooperative_matrix2"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_coopmat2_support.comp"
-        "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
-    )
+    if (NOT "${GGML_VULKAN_FORCE_COOPMAT2_GLSLC_SUPPORT}" MATCHES "^(|[Aa][Uu][Tt][Oo])$")
+        handle_forced_shader_extension(
+            "GL_NV_cooperative_matrix2"
+            "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+            "GGML_VULKAN_FORCE_COOPMAT2_GLSLC_SUPPORT"
+        )
+    else()
+        test_shader_extension_support(
+            "GL_NV_cooperative_matrix2"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_coopmat2_support.comp"
+            "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+        )
+    endif()
 
-    test_shader_extension_support(
-        "GL_EXT_integer_dot_product"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_integer_dot_support.comp"
-        "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
-    )
+    if (NOT "${GGML_VULKAN_FORCE_INTEGER_DOT_GLSLC_SUPPORT}" MATCHES "^(|[Aa][Uu][Tt][Oo])$")
+        handle_forced_shader_extension(
+            "GL_EXT_integer_dot_product"
+            "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
+            "GGML_VULKAN_FORCE_INTEGER_DOT_GLSLC_SUPPORT"
+        )
+    else()
+        test_shader_extension_support(
+            "GL_EXT_integer_dot_product"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_integer_dot_support.comp"
+            "GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT"
+        )
+    endif()
 
-    test_shader_extension_support(
-        "GL_EXT_bfloat16"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_bfloat16_support.comp"
-        "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
-    )
+    if (NOT "${GGML_VULKAN_FORCE_BFLOAT16_GLSLC_SUPPORT}" MATCHES "^(|[Aa][Uu][Tt][Oo])$")
+        handle_forced_shader_extension(
+            "GL_EXT_bfloat16"
+            "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
+            "GGML_VULKAN_FORCE_BFLOAT16_GLSLC_SUPPORT"
+        )
+    else()
+        test_shader_extension_support(
+            "GL_EXT_bfloat16"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/test_bfloat16_support.comp"
+            "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
+        )
+    endif()
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
