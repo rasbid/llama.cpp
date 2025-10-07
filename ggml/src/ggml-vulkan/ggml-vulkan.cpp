@@ -1679,6 +1679,11 @@ static void ggml_vk_profiler_begin_graph(ggml_backend_vk_context * ctx, uint32_t
     vk_profiling_state & profiler = *ctx->profiling;
     profiler.overflowed = false;
 
+    const uint32_t min_dispatch_guess = std::max<uint32_t>(estimated_dispatches, 1u);
+    const uint32_t max_dispatch_guess = std::numeric_limits<uint32_t>::max() / 2u;
+    const uint32_t clamped_dispatch_guess = std::min(min_dispatch_guess, max_dispatch_guess);
+    const uint32_t required_queries = std::max<uint32_t>(clamped_dispatch_guess * 2u, 256u);
+
     if (!profiler.logged_features) {
         profiler.timestamps_supported = ctx->device->properties.limits.timestampComputeAndGraphics != 0;
 
@@ -1688,19 +1693,11 @@ static void ggml_vk_profiler_begin_graph(ggml_backend_vk_context * ctx, uint32_t
                 GGML_LOG_WARN("ggml_vulkan: device %s does not support compute timestamps; profiling disabled\n",
                               ctx->device->name.c_str());
             }
+            profiler.dispatches.clear();
+            profiler.next_query = 0;
             return;
         }
 
-        if (profiler.query_pool) {
-            ctx->device->device.destroyQueryPool(profiler.query_pool);
-            profiler.query_pool = vk::QueryPool{};
-        }
-
-        profiler.capacity = std::max<uint32_t>(estimated_dispatches * 2u, 256u);
-
-        vk::QueryPoolCreateInfo query_info({}, vk::QueryType::eTimestamp, profiler.capacity);
-        profiler.query_pool = ctx->device->device.createQueryPool(query_info);
-        ctx->device->device.resetQueryPool(profiler.query_pool, 0, profiler.capacity);
         profiler.logged_features = true;
 
         GGML_LOG_INFO("ggml_vulkan: profiling enabled for %s (timestamp support: %s, pipeline stats: %s%s)\n",
@@ -1708,18 +1705,32 @@ static void ggml_vk_profiler_begin_graph(ggml_backend_vk_context * ctx, uint32_t
                       profiler.timestamps_supported ? "available" : "unavailable",
                       ctx->device->pipeline_executable_properties_support ? "available" : "unavailable",
                       vk_profiling_json_enabled ? " [json output]" : "");
-    } else {
-        if (!profiler.timestamps_supported) {
-            return;
+    } else if (!profiler.timestamps_supported) {
+        profiler.dispatches.clear();
+        profiler.next_query = 0;
+        return;
+    }
+
+    if (!profiler.query_pool || required_queries > profiler.capacity) {
+        if (profiler.query_pool) {
+            ctx->device->device.destroyQueryPool(profiler.query_pool);
+            profiler.query_pool = vk::QueryPool{};
         }
 
-        if (profiler.query_pool && profiler.next_query) {
-            ctx->device->device.resetQueryPool(profiler.query_pool, 0, profiler.capacity);
-        }
+        profiler.capacity = required_queries;
+
+        vk::QueryPoolCreateInfo query_info({}, vk::QueryType::eTimestamp, profiler.capacity);
+        profiler.query_pool = ctx->device->device.createQueryPool(query_info);
+    }
+
+    if (profiler.query_pool) {
+        ctx->device->device.resetQueryPool(profiler.query_pool, 0, profiler.capacity);
     }
 
     profiler.next_query = 0;
     profiler.dispatches.clear();
+    const size_t dispatch_capacity_hint = std::min<size_t>(clamped_dispatch_guess, profiler.capacity / 2u);
+    profiler.dispatches.reserve(dispatch_capacity_hint);
 }
 
 static void ggml_vk_profiler_end_graph(ggml_backend_vk_context * ctx) {
