@@ -29,6 +29,9 @@ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 #include <mutex>
 #include <future>
 #include <thread>
+#include <set>
+#include <cctype>
+#include <cstdio>
 
 #if defined(_MSC_VER)
 # define NOMINMAX 1
@@ -129,6 +132,8 @@ struct vk_pipeline_struct {
     bool compiled {};
     // number of registers used, extracted from pipeline executable properties
     uint32_t register_count {};
+    bool profiling_stats_cached {};
+    std::map<std::string, std::string> profiling_stats;
 };
 
 typedef std::shared_ptr<vk_pipeline_struct> vk_pipeline;
@@ -1409,6 +1414,127 @@ class vk_perf_logger {
     std::map<std::string, std::vector<uint64_t>> flops;
 };
 
+struct vk_profiling_dispatch_record {
+    vk_pipeline pipeline;
+    std::string pipeline_name;
+    std::string phase;
+    uint32_t query_begin {};
+    uint32_t query_end {};
+    std::array<uint32_t, 3> elements {};
+    std::array<uint32_t, 3> workgroups {};
+};
+
+struct vk_profiling_state {
+    vk::QueryPool query_pool;
+    uint32_t capacity {};
+    uint32_t next_query {};
+    bool overflowed {};
+    bool timestamps_supported {};
+    bool logged_features {};
+    bool warned_no_timestamps {};
+    std::vector<vk_profiling_dispatch_record> dispatches;
+};
+
+static bool ggml_vk_profiler_matches_pipeline(const std::string& name) {
+    return name.find("matmul") != std::string::npos || name.find("mul_mat") != std::string::npos;
+}
+
+static std::string ggml_vk_profiler_phase(const std::string& name) {
+    if (name.find("mul_mat_vec") != std::string::npos) {
+        return "infill";
+    }
+    if (ggml_vk_profiler_matches_pipeline(name)) {
+        return "prefill";
+    }
+    return "other";
+}
+
+static bool ggml_vk_profiler_is_relevant_stat(const std::string& name) {
+    std::string lowered(name.size(), '\0');
+    std::transform(name.begin(), name.end(), lowered.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return lowered.find("vgpr") != std::string::npos ||
+           lowered.find("sgpr") != std::string::npos ||
+           lowered.find("lds")  != std::string::npos ||
+           lowered.find("instr") != std::string::npos ||
+           lowered.find("register") != std::string::npos;
+}
+
+static std::string ggml_vk_profiler_json_escape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char c : value) {
+        switch (c) {
+            case '\\': escaped += "\\\\"; break;
+            case '\"': escaped += "\\\""; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buffer[7];
+                    snprintf(buffer, sizeof(buffer), "\\u%04x", c & 0xff);
+                    escaped += buffer;
+                } else {
+                    escaped += c;
+                }
+        }
+    }
+    return escaped;
+}
+
+static std::string ggml_vk_profiler_format_statistic(const vk::PipelineExecutableStatisticKHR & stat) {
+    switch (stat.format) {
+        case vk::PipelineExecutableStatisticFormatKHR::eBool32:
+            return stat.value.b32 ? "true" : "false";
+        case vk::PipelineExecutableStatisticFormatKHR::eInt64:
+            return std::to_string(stat.value.i64);
+        case vk::PipelineExecutableStatisticFormatKHR::eUint64:
+            return std::to_string(stat.value.u64);
+        case vk::PipelineExecutableStatisticFormatKHR::eFloat64: {
+            std::ostringstream ss;
+            ss.setf(std::ios::fixed);
+            ss << std::setprecision(3) << stat.value.f64;
+            return ss.str();
+        }
+        default:
+            return "unknown";
+    }
+}
+
+static void ggml_vk_profiler_cache_pipeline_stats(vk_device& device, vk_pipeline& pipeline) {
+    if (!pipeline) {
+        return;
+    }
+    if (!device->pipeline_executable_properties_support) {
+        if (pipeline->register_count && pipeline->profiling_stats.find("Register Count") == pipeline->profiling_stats.end()) {
+            pipeline->profiling_stats["Register Count"] = std::to_string(pipeline->register_count);
+        }
+        return;
+    }
+    if (!pipeline->profiling_stats_cached) {
+        try {
+            vk::PipelineInfoKHR pipeline_info;
+            pipeline_info.pipeline = pipeline->pipeline;
+            auto executables = device->device.getPipelineExecutablePropertiesKHR(pipeline_info);
+            for (uint32_t executable_index = 0; executable_index < executables.size(); ++executable_index) {
+                vk::PipelineExecutableInfoKHR executable_info;
+                executable_info.pipeline = pipeline->pipeline;
+                executable_info.executableIndex = executable_index;
+                auto statistics = device->device.getPipelineExecutableStatisticsKHR(executable_info);
+                for (const auto & stat : statistics) {
+                    pipeline->profiling_stats[stat.name] = ggml_vk_profiler_format_statistic(stat);
+                }
+            }
+        } catch (const vk::SystemError& e) {
+            GGML_LOG_WARN("ggml_vulkan: failed to query pipeline executable statistics for %s: %s\n", pipeline->name.c_str(), e.what());
+        }
+        pipeline->profiling_stats_cached = true;
+    }
+    if (pipeline->register_count && pipeline->profiling_stats.find("Register Count") == pipeline->profiling_stats.end()) {
+        pipeline->profiling_stats["Register Count"] = std::to_string(pipeline->register_count);
+    }
+}
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -1454,6 +1580,8 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+
+    std::unique_ptr<vk_profiling_state> profiling;
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -1536,6 +1664,257 @@ static bool vk_instance_initialized = false;
 static vk_instance_t vk_instance;
 
 static bool vk_perf_logger_enabled = false;
+static bool vk_profiling_enabled = false;
+static bool vk_profiling_json_enabled = false;
+
+static void ggml_vk_profiler_begin_graph(ggml_backend_vk_context * ctx, uint32_t estimated_dispatches) {
+    if (!vk_profiling_enabled) {
+        return;
+    }
+
+    if (!ctx->profiling) {
+        ctx->profiling = std::make_unique<vk_profiling_state>();
+    }
+
+    vk_profiling_state & profiler = *ctx->profiling;
+    profiler.overflowed = false;
+
+    const uint32_t min_dispatch_guess = std::max<uint32_t>(estimated_dispatches, 1u);
+    const uint32_t max_dispatch_guess = std::numeric_limits<uint32_t>::max() / 2u;
+    const uint32_t clamped_dispatch_guess = std::min(min_dispatch_guess, max_dispatch_guess);
+    const uint32_t required_queries = std::max<uint32_t>(clamped_dispatch_guess * 2u, 256u);
+
+    if (!profiler.logged_features) {
+        profiler.timestamps_supported = ctx->device->properties.limits.timestampComputeAndGraphics != 0;
+
+        if (!profiler.timestamps_supported) {
+            if (!profiler.warned_no_timestamps) {
+                profiler.warned_no_timestamps = true;
+                GGML_LOG_WARN("ggml_vulkan: device %s does not support compute timestamps; profiling disabled\n",
+                              ctx->device->name.c_str());
+            }
+            profiler.dispatches.clear();
+            profiler.next_query = 0;
+            return;
+        }
+
+        profiler.logged_features = true;
+
+        GGML_LOG_INFO("ggml_vulkan: profiling enabled for %s (timestamp support: %s, pipeline stats: %s%s)\n",
+                      ctx->device->name.c_str(),
+                      profiler.timestamps_supported ? "available" : "unavailable",
+                      ctx->device->pipeline_executable_properties_support ? "available" : "unavailable",
+                      vk_profiling_json_enabled ? " [json output]" : "");
+    } else if (!profiler.timestamps_supported) {
+        profiler.dispatches.clear();
+        profiler.next_query = 0;
+        return;
+    }
+
+    if (!profiler.query_pool || required_queries > profiler.capacity) {
+        if (profiler.query_pool) {
+            ctx->device->device.destroyQueryPool(profiler.query_pool);
+            profiler.query_pool = vk::QueryPool{};
+        }
+
+        profiler.capacity = required_queries;
+
+        vk::QueryPoolCreateInfo query_info({}, vk::QueryType::eTimestamp, profiler.capacity);
+        profiler.query_pool = ctx->device->device.createQueryPool(query_info);
+    }
+
+    if (profiler.query_pool) {
+        ctx->device->device.resetQueryPool(profiler.query_pool, 0, profiler.capacity);
+    }
+
+    profiler.next_query = 0;
+    profiler.dispatches.clear();
+    const size_t dispatch_capacity_hint = std::min<size_t>(clamped_dispatch_guess, profiler.capacity / 2u);
+    profiler.dispatches.reserve(dispatch_capacity_hint);
+}
+
+static void ggml_vk_profiler_end_graph(ggml_backend_vk_context * ctx) {
+    if (!vk_profiling_enabled || !ctx->profiling) {
+        return;
+    }
+
+    vk_profiling_state & profiler = *ctx->profiling;
+
+    if (!profiler.timestamps_supported || !profiler.query_pool) {
+        return;
+    }
+
+    if (profiler.overflowed) {
+        GGML_LOG_WARN("ggml_vulkan: profiling query pool exhausted on %s; results incomplete\n", ctx->device->name.c_str());
+    }
+
+    const uint32_t query_count = profiler.next_query;
+    if (query_count == 0 || profiler.dispatches.empty()) {
+        return;
+    }
+
+    std::vector<uint64_t> timestamps(query_count);
+    VK_CHECK(ctx->device->device.getQueryPoolResults(profiler.query_pool,
+                                                     0,
+                                                     query_count,
+                                                     sizeof(uint64_t) * query_count,
+                                                     timestamps.data(),
+                                                     sizeof(uint64_t),
+                                                     vk::QueryResultFlagBits::e64),
+             "getQueryPoolResults");
+
+    double timestamp_period = ctx->device->properties.limits.timestampPeriod;
+    if (timestamp_period == 0.0) {
+        timestamp_period = 1.0;
+    }
+
+    struct vk_profiling_pipeline_summary {
+        std::string name;
+        std::string phase;
+        double total_ns {};
+        uint32_t count {};
+        vk_pipeline pipeline;
+    };
+
+    std::map<std::pair<std::string, std::string>, vk_profiling_pipeline_summary> summary_map;
+    std::vector<double> dispatch_times_us;
+    dispatch_times_us.reserve(profiler.dispatches.size());
+
+    for (const auto & record : profiler.dispatches) {
+        double duration_us = 0.0;
+
+        if (record.query_end < timestamps.size() && record.query_begin < timestamps.size()) {
+            const uint64_t start = timestamps[record.query_begin];
+            const uint64_t end   = timestamps[record.query_end];
+            const double duration_ns = double(end - start) * timestamp_period;
+            duration_us = duration_ns / 1000.0;
+
+            auto key = std::make_pair(record.pipeline_name, record.phase);
+            auto & entry = summary_map[key];
+            entry.name = record.pipeline_name;
+            entry.phase = record.phase;
+            entry.total_ns += duration_ns;
+            entry.count += 1;
+            if (record.pipeline) {
+                entry.pipeline = record.pipeline;
+            }
+        } else {
+            GGML_LOG_WARN("ggml_vulkan: profiling query index out of range for %s\n", record.pipeline_name.c_str());
+        }
+
+        dispatch_times_us.push_back(duration_us);
+    }
+
+    if (!profiler.dispatches.empty()) {
+        GGML_LOG_INFO("ggml_vulkan: profiling dispatches for %s\n", ctx->device->name.c_str());
+    }
+
+    for (size_t i = 0; i < profiler.dispatches.size(); ++i) {
+        const auto & record = profiler.dispatches[i];
+        const double duration_us = dispatch_times_us[i];
+        GGML_LOG_INFO("  dispatch %zu [%s] %s -> %.3f us (wg=%u,%u,%u)\n",
+                      i,
+                      record.phase.c_str(),
+                      record.pipeline_name.c_str(),
+                      duration_us,
+                      record.workgroups[0],
+                      record.workgroups[1],
+                      record.workgroups[2]);
+    }
+
+    std::vector<vk_profiling_pipeline_summary> summaries;
+    summaries.reserve(summary_map.size());
+    for (auto & kv : summary_map) {
+        summaries.push_back(kv.second);
+    }
+
+    std::sort(summaries.begin(), summaries.end(), [](const vk_profiling_pipeline_summary & a, const vk_profiling_pipeline_summary & b) {
+        return a.total_ns > b.total_ns;
+    });
+
+    for (const auto & entry : summaries) {
+        const double avg_us = entry.count ? (entry.total_ns / entry.count) / 1000.0 : 0.0;
+        const double total_us = entry.total_ns / 1000.0;
+
+        std::string stats_suffix;
+        if (entry.pipeline) {
+            vk_pipeline pipeline = entry.pipeline;
+            ggml_vk_profiler_cache_pipeline_stats(ctx->device, pipeline);
+            std::vector<std::pair<std::string, std::string>> stats;
+            for (const auto & stat : pipeline->profiling_stats) {
+                if (ggml_vk_profiler_is_relevant_stat(stat.first)) {
+                    stats.emplace_back(stat.first, stat.second);
+                }
+            }
+            if (!stats.empty()) {
+                std::ostringstream stats_stream;
+                stats_stream << " stats: ";
+                for (size_t i = 0; i < stats.size(); ++i) {
+                    if (i != 0) {
+                        stats_stream << ", ";
+                    }
+                    stats_stream << stats[i].first << "=" << stats[i].second;
+                }
+                stats_suffix = stats_stream.str();
+            }
+        }
+
+        GGML_LOG_INFO("  summary [%s] %s dispatches=%u avg=%.3f us total=%.3f us%s\n",
+                      entry.phase.c_str(),
+                      entry.name.c_str(),
+                      entry.count,
+                      avg_us,
+                      total_us,
+                      stats_suffix.c_str());
+    }
+
+    if (vk_profiling_json_enabled && !profiler.dispatches.empty()) {
+        std::ostringstream json;
+        json << "{\n";
+        json << "  \"device\": \"" << ggml_vk_profiler_json_escape(ctx->device->name) << "\",\n";
+        json << "  \"timestamp_period_ns\": " << timestamp_period << ",\n";
+        json << "  \"dispatches\": [\n";
+        for (size_t i = 0; i < profiler.dispatches.size(); ++i) {
+            const auto & record = profiler.dispatches[i];
+            json << "    {\n";
+            json << "      \"pipeline\": \"" << ggml_vk_profiler_json_escape(record.pipeline_name) << "\",\n";
+            json << "      \"phase\": \"" << ggml_vk_profiler_json_escape(record.phase) << "\",\n";
+            std::ostringstream time_stream;
+            time_stream.setf(std::ios::fixed);
+            time_stream << std::setprecision(3) << dispatch_times_us[i];
+            json << "      \"time_us\": " << time_stream.str() << ",\n";
+            json << "      \"workgroups\": [" << record.workgroups[0] << ", " << record.workgroups[1] << ", " << record.workgroups[2] << "],\n";
+            json << "      \"executables\": {";
+            bool first = true;
+            if (record.pipeline) {
+                vk_pipeline pipeline = record.pipeline;
+                ggml_vk_profiler_cache_pipeline_stats(ctx->device, pipeline);
+                for (const auto & stat : pipeline->profiling_stats) {
+                    if (!ggml_vk_profiler_is_relevant_stat(stat.first)) {
+                        continue;
+                    }
+                    if (!first) {
+                        json << ", ";
+                    }
+                    json << "\"" << ggml_vk_profiler_json_escape(stat.first) << "\": \"" << ggml_vk_profiler_json_escape(stat.second) << "\"";
+                    first = false;
+                }
+            }
+            json << "}\n";
+            json << "    }";
+            if (i + 1 < profiler.dispatches.size()) {
+                json << ",";
+            }
+            json << "\n";
+        }
+        json << "  ]\n";
+        json << "}\n";
+        GGML_LOG_INFO("%s", json.str().c_str());
+    }
+
+    profiler.dispatches.clear();
+    profiler.next_query = 0;
+}
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
 static size_t vk_skip_checks;
@@ -4574,6 +4953,19 @@ static void ggml_vk_instance_init() {
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
 
+    const char * profiling_env = getenv("GGML_VK_PROFILING");
+    if (profiling_env != nullptr) {
+        vk_profiling_enabled = true;
+        std::string profiling_value = profiling_env;
+        std::string profiling_value_lower = profiling_value;
+        std::transform(profiling_value_lower.begin(), profiling_value_lower.end(), profiling_value_lower.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        vk_profiling_json_enabled = profiling_value_lower.find("json") != std::string::npos;
+    } else {
+        vk_profiling_enabled = false;
+        vk_profiling_json_enabled = false;
+    }
+
     // See https://github.com/KhronosGroup/Vulkan-Hpp?tab=readme-ov-file#extensions--per-device-function-pointers-
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vk_instance.instance);
 
@@ -5223,7 +5615,41 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
                                 0,
                                 { descriptor_set },
                                 {});
+    bool profile_dispatch = false;
+    uint32_t query_begin = 0;
+    uint32_t query_end = 0;
+    vk_profiling_state * profiler_state = nullptr;
+    if (vk_profiling_enabled && ctx->profiling && ctx->profiling->timestamps_supported && ctx->profiling->query_pool &&
+        !ctx->profiling->overflowed && ggml_vk_profiler_matches_pipeline(pipeline->name)) {
+        profiler_state = ctx->profiling.get();
+        if (profiler_state->next_query + 1 < profiler_state->capacity) {
+            query_begin = profiler_state->next_query++;
+            query_end = profiler_state->next_query++;
+            profile_dispatch = true;
+
+            vk_profiling_dispatch_record record;
+            record.pipeline = pipeline;
+            record.pipeline_name = pipeline->name;
+            record.phase = ggml_vk_profiler_phase(pipeline->name);
+            record.query_begin = query_begin;
+            record.query_end = query_end;
+            record.elements = elements;
+            record.workgroups = { wg0, wg1, wg2 };
+            profiler_state->dispatches.push_back(std::move(record));
+        } else {
+            profiler_state->overflowed = true;
+        }
+    }
+
+    if (profile_dispatch) {
+        subctx->s->buffer.writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, profiler_state->query_pool, query_begin);
+    }
+
     subctx->s->buffer.dispatch(wg0, wg1, wg2);
+
+    if (profile_dispatch) {
+        subctx->s->buffer.writeTimestamp(vk::PipelineStageFlagBits::eComputeShader, profiler_state->query_pool, query_end);
+    }
 }
 
 static void ggml_vk_end_submission(vk_submission& s, std::vector<vk_semaphore> wait_semaphores, std::vector<vk_semaphore> signal_semaphores) {
@@ -11470,6 +11896,12 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_pools.clear();
     ctx->descriptor_sets.clear();
 
+    if (ctx->profiling && ctx->profiling->query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->profiling->query_pool);
+        ctx->profiling->query_pool = vk::QueryPool{};
+    }
+    ctx->profiling.reset();
+
     ctx->compute_cmd_pool.destroy(ctx->device->device);
     ctx->transfer_cmd_pool.destroy(ctx->device->device);
 }
@@ -11973,6 +12405,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Reserve tensor context space for all nodes
     ctx->tensor_ctxs.resize(cgraph->n_nodes);
 
+    if (vk_profiling_enabled) {
+        uint32_t expected_dispatches = (uint32_t)(std::max(1, cgraph->n_nodes) * 6);
+        ggml_vk_profiler_begin_graph(ctx, expected_dispatches);
+    }
+
     bool first_node_in_batch = true; // true if next node will be first node in a batch
     int submit_node_idx = 0; // index to first node in a batch
 
@@ -12108,6 +12545,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         ctx->device->perf_logger->print_timings();
+    }
+
+    if (vk_profiling_enabled) {
+        ggml_vk_profiler_end_graph(ctx);
     }
 
     ggml_vk_graph_cleanup(ctx);
