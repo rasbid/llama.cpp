@@ -1693,7 +1693,7 @@ static void ggml_vk_profiler_begin_graph(ggml_backend_vk_context * ctx, uint32_t
 
         if (profiler.query_pool) {
             ctx->device->device.destroyQueryPool(profiler.query_pool);
-            profiler.query_pool = {};
+            profiler.query_pool = vk::QueryPool{};
         }
 
         profiler.capacity = std::max<uint32_t>(estimated_dispatches * 2u, 256u);
@@ -1827,9 +1827,10 @@ static void ggml_vk_profiler_end_graph(ggml_backend_vk_context * ctx) {
 
         std::string stats_suffix;
         if (entry.pipeline) {
-            ggml_vk_profiler_cache_pipeline_stats(ctx->device, entry.pipeline);
+            vk_pipeline pipeline = entry.pipeline;
+            ggml_vk_profiler_cache_pipeline_stats(ctx->device, pipeline);
             std::vector<std::pair<std::string, std::string>> stats;
-            for (const auto & stat : entry.pipeline->profiling_stats) {
+            for (const auto & stat : pipeline->profiling_stats) {
                 if (ggml_vk_profiler_is_relevant_stat(stat.first)) {
                     stats.emplace_back(stat.first, stat.second);
                 }
@@ -1875,8 +1876,9 @@ static void ggml_vk_profiler_end_graph(ggml_backend_vk_context * ctx) {
             json << "      \"executables\": {";
             bool first = true;
             if (record.pipeline) {
-                ggml_vk_profiler_cache_pipeline_stats(ctx->device, record.pipeline);
-                for (const auto & stat : record.pipeline->profiling_stats) {
+                vk_pipeline pipeline = record.pipeline;
+                ggml_vk_profiler_cache_pipeline_stats(ctx->device, pipeline);
+                for (const auto & stat : pipeline->profiling_stats) {
                     if (!ggml_vk_profiler_is_relevant_stat(stat.first)) {
                         continue;
                     }
