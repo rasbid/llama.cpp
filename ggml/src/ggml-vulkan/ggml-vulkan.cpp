@@ -5275,10 +5275,28 @@ static void deferred_memset(void * dst, uint32_t val, size_t size, std::vector<v
 }
 
 static void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size) {
-    if (device->sync_staging == nullptr || device->sync_staging->size < size) {
-        VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << ")");
+    // Optimize staging buffer size for better performance
+    // Use larger buffer sizes to reduce allocation overhead and improve GPU utilization
+    size_t optimized_size = size;
+    
+    // For RX-580 (GCN), use larger staging buffers for better memory bandwidth utilization
+    if (device->architecture == vk_device_architecture::AMD_GCN) {
+        // Round up to next power of 2 for better alignment, minimum 64KB
+        if (size < 65536) {
+            optimized_size = 65536;  // 64KB minimum
+        } else {
+            // Round up to next power of 2
+            optimized_size = 1;
+            while (optimized_size < size) {
+                optimized_size <<= 1;
+            }
+        }
+    }
+    
+    if (device->sync_staging == nullptr || device->sync_staging->size < optimized_size) {
+        VK_LOG_MEMORY("ggml_vk_ensure_sync_staging_buffer(" << size << " -> " << optimized_size << ")");
         ggml_vk_destroy_buffer(device->sync_staging);
-        device->sync_staging = ggml_vk_create_buffer_check(device, size,
+        device->sync_staging = ggml_vk_create_buffer_check(device, optimized_size,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     }
@@ -5342,7 +5360,31 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
         }
 
         ggml_vk_sync_buffers(ctx, subctx);
-        subctx->s->buffer.copyBuffer(buf->buffer, dst->buffer, slices);
+        // Optimize for GCN: batch multiple small copies into fewer operations
+        if (dst->device->architecture == vk_device_architecture::AMD_GCN && slices.size() > 1) {
+            // Try to merge adjacent slices to reduce copy operations
+            std::vector<vk::BufferCopy> merged_slices;
+            merged_slices.reserve(slices.size());
+            
+            for (size_t i = 0; i < slices.size(); ++i) {
+                if (merged_slices.empty() || 
+                    merged_slices.back().srcOffset + merged_slices.back().size != slices[i].srcOffset ||
+                    merged_slices.back().dstOffset + merged_slices.back().size != slices[i].dstOffset) {
+                    merged_slices.push_back(slices[i]);
+                } else {
+                    merged_slices.back().size += slices[i].size;
+                }
+            }
+            
+            if (merged_slices.size() < slices.size()) {
+                VK_LOG_DEBUG("Merged " << slices.size() << " copies into " << merged_slices.size() << " operations");
+                subctx->s->buffer.copyBuffer(buf->buffer, dst->buffer, merged_slices);
+            } else {
+                subctx->s->buffer.copyBuffer(buf->buffer, dst->buffer, slices);
+            }
+        } else {
+            subctx->s->buffer.copyBuffer(buf->buffer, dst->buffer, slices);
+        }
         return;
     }
 
@@ -5359,20 +5401,71 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
     ggml_vk_sync_buffers(ctx, subctx);
     vkCmdCopyBuffer(subctx->s->buffer, (VkBuffer)staging->buffer, (VkBuffer)dst->buffer, 1, &buf_copy);
 
-    for (uint64_t i3 = 0; i3 < ne3; i3++) {
-        for (uint64_t i2 = 0; i2 < ne2; i2++) {
-            // Find longest contiguous slice
-            if (ne1*nb1 == dstnb2) {
-                deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2, dstnb2, &subctx->in_memcpys);
-            } else {
-                for (uint64_t i1 = 0; i1 < ne1; i1++) {
-                    if (ne0*nb0/bs == dstnb1) {
-                        deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2 + i1*dstnb1, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2 + i1*nb1, dstnb1, &subctx->in_memcpys);
-                    } else {
-                        const uint64_t s_off = buf_offset + i3*nb3 + i2*nb2 + i1*nb1;
-                        const uint64_t d_off = i3*dstnb3 + i2*dstnb2 + i1*dstnb1;
-                        for (uint64_t i0 = 0; i0 < ne0; i0++) {
-                            deferred_memcpy((uint8_t *)staging->ptr + d_off + i0*dstnb0, (const uint8_t *) tensor->data + s_off + i0*nb0, dstnb0, &subctx->in_memcpys);
+    // Optimize memory transfers for GCN architecture
+    if (ctx->device->architecture == vk_device_architecture::AMD_GCN) {
+        // For GCN, try to minimize the number of deferred operations
+        // by doing larger contiguous copies when possible
+        for (uint64_t i3 = 0; i3 < ne3; i3++) {
+            for (uint64_t i2 = 0; i2 < ne2; i2++) {
+                // Find longest contiguous slice
+                if (ne1*nb1 == dstnb2) {
+                    // Single large copy for entire 2D slice
+                    deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2, dstnb2, &subctx->in_memcpys);
+                } else {
+                    for (uint64_t i1 = 0; i1 < ne1; i1++) {
+                        if (ne0*nb0/bs == dstnb1) {
+                            // Single copy for entire 1D slice
+                            deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2 + i1*dstnb1, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2 + i1*nb1, dstnb1, &subctx->in_memcpys);
+                        } else {
+                            // For GCN, try to batch small copies when possible
+                            const uint64_t s_off = buf_offset + i3*nb3 + i2*nb2 + i1*nb1;
+                            const uint64_t d_off = i3*dstnb3 + i2*dstnb2 + i1*dstnb1;
+                            
+                            // Batch small copies if they're contiguous in source
+                            uint64_t batch_start = 0;
+                            for (uint64_t i0 = 0; i0 < ne0; i0++) {
+                                if (i0 == 0 || (s_off + i0*nb0) != (s_off + (i0-1)*nb0) + dstnb0) {
+                                    // Start new batch
+                                    if (i0 > 0) {
+                                        // Execute previous batch
+                                        const uint64_t batch_size = (i0 - batch_start) * dstnb0;
+                                        deferred_memcpy((uint8_t *)staging->ptr + d_off + batch_start*dstnb0, 
+                                                       (const uint8_t *) tensor->data + s_off + batch_start*nb0, 
+                                                       batch_size, &subctx->in_memcpys);
+                                    }
+                                    batch_start = i0;
+                                }
+                                
+                                // If this is the last element, execute the final batch
+                                if (i0 == ne0 - 1) {
+                                    const uint64_t batch_size = (i0 - batch_start + 1) * dstnb0;
+                                    deferred_memcpy((uint8_t *)staging->ptr + d_off + batch_start*dstnb0, 
+                                                   (const uint8_t *) tensor->data + s_off + batch_start*nb0, 
+                                                   batch_size, &subctx->in_memcpys);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Original implementation for non-GCN architectures
+        for (uint64_t i3 = 0; i3 < ne3; i3++) {
+            for (uint64_t i2 = 0; i2 < ne2; i2++) {
+                // Find longest contiguous slice
+                if (ne1*nb1 == dstnb2) {
+                    deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2, dstnb2, &subctx->in_memcpys);
+                } else {
+                    for (uint64_t i1 = 0; i1 < ne1; i1++) {
+                        if (ne0*nb0/bs == dstnb1) {
+                            deferred_memcpy((uint8_t *)staging->ptr + i3*dstnb3 + i2*dstnb2 + i1*dstnb1, (const uint8_t *) tensor->data + buf_offset + i3*nb3 + i2*nb2 + i1*nb1, dstnb1, &subctx->in_memcpys);
+                        } else {
+                            const uint64_t s_off = buf_offset + i3*nb3 + i2*nb2 + i1*nb1;
+                            const uint64_t d_off = i3*dstnb3 + i2*dstnb2 + i1*dstnb1;
+                            for (uint64_t i0 = 0; i0 < ne0; i0++) {
+                                deferred_memcpy((uint8_t *)staging->ptr + d_off + i0*dstnb0, (const uint8_t *) tensor->data + s_off + i0*nb0, dstnb0, &subctx->in_memcpys);
+                            }
                         }
                     }
                 }
