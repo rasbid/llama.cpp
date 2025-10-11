@@ -2324,10 +2324,25 @@ static const std::unordered_map<std::string, uint32_t> rdna2_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
 };
 
+// Pipeline configuration for GCN GPUs - aggressive subgroup sizes for better performance
+static const std::unordered_map<std::string, uint32_t> gcn_pipelines = {
+    {"soft_max", 64}, {"im2col", 64}, {"l2_norm", 64}, {"rms_norm", 64},
+    {"mul_mat_vec", 64}, {"mul_mat_vec_f16", 64}, {"mul_mat_vec_f32_f16", 64},
+    {"mul_mm", 64}, {"copy_to_quant", 64}, {"argsort", 64}
+};
+
 static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;
+static constexpr uint32_t GCN_DEFAULT_SUBGROUP_SIZE = 64;
 
 // Define configurations for different GPUs.
 static std::vector<GpuPipelineConfig> gpu_pipeline_configs = {
+    {
+        vk_device_architecture::AMD_GCN,
+        {
+            gcn_pipelines,
+        },
+        GCN_DEFAULT_SUBGROUP_SIZE
+    },
     {
         vk_device_architecture::AMD_RDNA1,
         {
@@ -2378,8 +2393,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
     const uint32_t mul_mat_subgroup_size_16 = std::max(mul_mat_subgroup_size, 16u);
     const uint32_t mul_mat_subgroup_size_32 = std::max(mul_mat_subgroup_size, 32u);
 
+    // GCN-specific aggressive subgroup optimization
+    // For GCN architecture, be more permissive with subgroup size requirements
     const bool subgroup_min_size_16 = (!device->subgroup_size_control && device->subgroup_size >= 16) ||
-                                      (device->subgroup_size_control && device->subgroup_max_size >= 16);
+                                      (device->subgroup_size_control && device->subgroup_max_size >= 16) ||
+                                      (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_GCN && device->subgroup_max_size >= 8);
 
     // mulmat
     std::vector<uint32_t> l_warptile, m_warptile, s_warptile,
@@ -3592,6 +3610,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
 
         // Use collectives on pre-Turing NVIDIA GPUs and GCN AMD cards, which had slower integer math.
+        // GCN: Be more aggressive with collectives for better performance
         bool allow_collectives_nv = device->vendor_id != VK_VENDOR_ID_NVIDIA ||
                                     device->architecture == vk_device_architecture::NVIDIA_PRE_TURING;
         bool allow_collectives_amd = device->vendor_id != VK_VENDOR_ID_AMD ||
