@@ -3114,7 +3114,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
         rm_stdq = 2;
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    // v23: Re-enable subgroup reductions for DMMV on wave64 hardware
+    // Allow wave64 subgroup paths when full subgroups are guaranteed (subgroup_size_control enabled)
+    const bool use_subgroups = device->subgroup_arithmetic && 
+                               (device->architecture != vk_device_architecture::AMD_GCN || 
+                                (device->subgroup_size_control && device->subgroup_max_size >= 64));
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
