@@ -3836,7 +3836,14 @@ static vk_device ggml_vk_get_device(size_t idx) {
         } else if (amd_shader_core_properties2) {
             device->shader_core_count = amd_shader_core_properties2_props.activeComputeUnitCount;
         } else {
-            device->shader_core_count = 0;
+            // Backfill shader_core_count for older AMD drivers missing VK_AMD_shader_core_properties2
+            // This enables split-K and flash-attn heuristics on Polaris-era hardware
+            if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == vk_device_architecture::AMD_GCN) {
+                // Polaris (RX 580) has 36 Compute Units
+                device->shader_core_count = 36;
+            } else {
+                device->shader_core_count = 0;
+            }
         }
         device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;
 
