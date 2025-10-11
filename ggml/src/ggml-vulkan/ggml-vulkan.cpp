@@ -258,6 +258,15 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
         }
 
         if (!amd_shader_core_properties || !integer_dot_product || !subgroup_size_control) {
+            // Fallback detection for GCN without modern extensions (common on gfx803/Polaris)
+            // Detect Polaris (RX 580) by device name pattern
+            std::string device_name(props.deviceName);
+            if (device_name.find("RX 580") != std::string::npos || 
+                device_name.find("RX 480") != std::string::npos ||
+                device_name.find("RX 570") != std::string::npos ||
+                device_name.find("RX 470") != std::string::npos) {
+                return vk_device_architecture::AMD_GCN;
+            }
             return vk_device_architecture::OTHER;
         }
 
