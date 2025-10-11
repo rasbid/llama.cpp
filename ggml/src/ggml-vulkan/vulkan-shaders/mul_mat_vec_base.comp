@@ -98,7 +98,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
 }
 
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 0) const uint BLOCK_SIZE = 64;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
