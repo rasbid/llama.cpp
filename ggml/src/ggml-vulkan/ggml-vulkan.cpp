@@ -3703,6 +3703,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         bool fp16_compute = false;
         bool maintenance4_support = false;
         bool sm_builtins = false;
+        bool amd_shader_core_properties = false;
         bool amd_shader_core_properties2 = false;
         bool pipeline_robustness = false;
         bool coopmat2_support = false;
@@ -3720,6 +3721,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 fp16_compute = true;
             } else if (strcmp("VK_NV_shader_sm_builtins", properties.extensionName) == 0) {
                 sm_builtins = true;
+            } else if (strcmp("VK_AMD_shader_core_properties", properties.extensionName) == 0) {
+                amd_shader_core_properties = true;
             } else if (strcmp("VK_AMD_shader_core_properties2", properties.extensionName) == 0) {
                 amd_shader_core_properties2 = true;
             } else if (strcmp("VK_EXT_pipeline_robustness", properties.extensionName) == 0) {
@@ -3760,6 +3763,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         vk::PhysicalDeviceSubgroupProperties subgroup_props;
         vk::PhysicalDeviceDriverProperties driver_props;
         vk::PhysicalDeviceShaderSMBuiltinsPropertiesNV sm_props;
+        vk::PhysicalDeviceShaderCorePropertiesAMD amd_shader_core_properties_props;
         vk::PhysicalDeviceShaderCoreProperties2AMD amd_shader_core_properties2_props;
         vk::PhysicalDeviceVulkan11Properties vk11_props;
         vk::PhysicalDeviceVulkan12Properties vk12_props;
@@ -3781,6 +3785,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (sm_builtins) {
             last_struct->pNext = (VkBaseOutStructure *)&sm_props;
             last_struct = (VkBaseOutStructure *)&sm_props;
+        }
+        if (amd_shader_core_properties) {
+            last_struct->pNext = (VkBaseOutStructure *)&amd_shader_core_properties_props;
+            last_struct = (VkBaseOutStructure *)&amd_shader_core_properties_props;
         }
         if (amd_shader_core_properties2) {
             last_struct->pNext = (VkBaseOutStructure *)&amd_shader_core_properties2_props;
@@ -3837,6 +3845,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->shader_core_count = amd_shader_core_properties2_props.activeComputeUnitCount;
         } else {
             device->shader_core_count = 0;
+        }
+        if (device->shader_core_count == 0 && amd_shader_core_properties && !amd_shader_core_properties2) {
+            const uint32_t shader_engine_count = amd_shader_core_properties_props.shaderEngineCount;
+            const uint32_t shader_arrays_per_engine = amd_shader_core_properties_props.shaderArraysPerEngineCount;
+            const uint32_t compute_units_per_array = amd_shader_core_properties_props.computeUnitsPerShaderArray;
+            const uint32_t total_compute_units = shader_engine_count * shader_arrays_per_engine * compute_units_per_array;
+            device->shader_core_count = total_compute_units;
         }
         device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;
 
