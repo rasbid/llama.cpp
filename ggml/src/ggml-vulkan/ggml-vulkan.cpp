@@ -237,7 +237,24 @@ enum vk_device_architecture {
     NVIDIA_PRE_TURING,
 };
 
-static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
+static const char * vk_device_architecture_name(vk_device_architecture arch) {
+    switch (arch) {
+        case vk_device_architecture::AMD_GCN:        return "AMD GCN";
+        case vk_device_architecture::AMD_RDNA1:      return "AMD RDNA1";
+        case vk_device_architecture::AMD_RDNA2:      return "AMD RDNA2";
+        case vk_device_architecture::AMD_RDNA3:      return "AMD RDNA3";
+        case vk_device_architecture::INTEL_XE2:      return "Intel Xe2";
+        case vk_device_architecture::NVIDIA_PRE_TURING: return "NVIDIA pre-Turing";
+        case vk_device_architecture::OTHER:          return "Other";
+    }
+    return "Other";
+}
+
+static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device, bool *missing_subgroup_size_control = nullptr) {
+    if (missing_subgroup_size_control != nullptr) {
+        *missing_subgroup_size_control = false;
+    }
+
     vk::PhysicalDeviceProperties props = device.getProperties();
 
     if (props.vendorID == VK_VENDOR_ID_AMD) {
@@ -257,7 +274,7 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             }
         }
 
-        if (!amd_shader_core_properties || !integer_dot_product || !subgroup_size_control) {
+        if (!amd_shader_core_properties) {
             return vk_device_architecture::OTHER;
         }
 
@@ -267,23 +284,47 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
         vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT subgroup_size_control_props;
 
         props2.pNext = &shader_core_props_amd;
-        shader_core_props_amd.pNext = &integer_dot_props;
-        integer_dot_props.pNext = &subgroup_size_control_props;
+        shader_core_props_amd.pNext = nullptr;
+
+        VkBaseOutStructure *last_struct = (VkBaseOutStructure *)&shader_core_props_amd;
+
+        if (integer_dot_product) {
+            integer_dot_props.pNext = nullptr;
+            last_struct->pNext = (VkBaseOutStructure *)&integer_dot_props;
+            last_struct = (VkBaseOutStructure *)&integer_dot_props;
+        }
+
+        if (subgroup_size_control) {
+            subgroup_size_control_props.pNext = nullptr;
+            last_struct->pNext = (VkBaseOutStructure *)&subgroup_size_control_props;
+            last_struct = (VkBaseOutStructure *)&subgroup_size_control_props;
+        } else {
+            last_struct->pNext = nullptr;
+        }
 
         device.getProperties2(&props2);
 
-        if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 64) {
-            return vk_device_architecture::AMD_GCN;
-        }
-        if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 32) {
+        if (subgroup_size_control) {
+            if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 64) {
+                return vk_device_architecture::AMD_GCN;
+            }
+            if (subgroup_size_control_props.maxSubgroupSize == 64 && subgroup_size_control_props.minSubgroupSize == 32) {
             // RDNA
             if (shader_core_props_amd.wavefrontsPerSimd == 20) {
                 return vk_device_architecture::AMD_RDNA1;
             }
-            if (integer_dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated) {
+            if (integer_dot_product && integer_dot_props.integerDotProduct4x8BitPackedMixedSignednessAccelerated) {
                 return vk_device_architecture::AMD_RDNA3;
             }
             return vk_device_architecture::AMD_RDNA2;
+        }
+        }
+
+        if (shader_core_props_amd.wavefrontSize == 64) {
+            if (missing_subgroup_size_control != nullptr && !subgroup_size_control) {
+                *missing_subgroup_size_control = true;
+            }
+            return vk_device_architecture::AMD_GCN;
         }
     } else if (props.vendorID == VK_VENDOR_ID_INTEL) {
         const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
@@ -415,6 +456,7 @@ struct vk_device_struct {
     int32_t mmvq_mode;
 
     bool subgroup_size_control;
+    bool subgroup_size_control_missing;
     uint32_t subgroup_min_size;
     uint32_t subgroup_max_size;
     bool subgroup_require_full_support;
@@ -3685,7 +3727,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->physical_device = physical_devices[dev_num];
         const std::vector<vk::ExtensionProperties> ext_props = device->physical_device.enumerateDeviceExtensionProperties();
 
-        device->architecture = get_device_architecture(device->physical_device);
+        device->architecture = get_device_architecture(device->physical_device, &device->subgroup_size_control_missing);
+        GGML_LOG_INFO("ggml_vulkan: detected architecture %s%s\n",
+                      vk_device_architecture_name(device->architecture),
+                      device->subgroup_size_control_missing ? " (VK_EXT_subgroup_size_control unavailable)" : "");
 
         const char* GGML_VK_PREFER_HOST_MEMORY = getenv("GGML_VK_PREFER_HOST_MEMORY");
         device->prefer_host_memory = GGML_VK_PREFER_HOST_MEMORY != nullptr;
