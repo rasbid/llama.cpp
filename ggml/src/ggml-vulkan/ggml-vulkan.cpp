@@ -2464,8 +2464,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
         // chip specific tuning
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
-            m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
-            m_warptile_mmqid = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
+            const std::vector<uint32_t> amd_l_warptile = { 256, 128, 128, 32, 16, 16, 2, 4, 4, 1, 16 };
+            const std::vector<uint32_t> amd_m_warptile = { 256,  64,  64, 32, 16, 16, 2, 2, 2, 1, 16 };
+            const std::vector<uint32_t> amd_s_warptile = { 128,  64,  64, 32, 16, 16, 2, 2, 1, 1, 16 };
+
+            l_warptile_mmq = l_warptile_mmq_int = amd_l_warptile;
+            m_warptile_mmq = m_warptile_mmq_int = amd_m_warptile;
+            s_warptile_mmq = s_warptile_mmq_int = amd_s_warptile;
+
+            l_warptile_mmqid = amd_l_warptile;
+            m_warptile_mmqid = amd_m_warptile;
+            s_warptile_mmqid = amd_s_warptile;
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
