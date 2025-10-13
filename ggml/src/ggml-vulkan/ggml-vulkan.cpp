@@ -2025,20 +2025,33 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
 
+    bool attempted_non_host_visible = false;
+    bool fallback_to_host_visible = false;
+
     for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
         const auto & req_flags = *it;
+        const bool current_host_visible = static_cast<bool>(req_flags & vk::MemoryPropertyFlagBits::eHostVisible);
 
         uint32_t memory_type_index = find_properties(&mem_props, &mem_req, req_flags);
 
         if (memory_type_index == UINT32_MAX) {
+            if (!current_host_visible) {
+                attempted_non_host_visible = true;
+            }
             continue;
         }
         buf->memory_property_flags = req_flags;
 
         try {
             buf->device_memory = device->device.allocateMemory({ mem_req.size, memory_type_index });
+            if (current_host_visible && attempted_non_host_visible) {
+                fallback_to_host_visible = true;
+            }
             break;
         } catch (const vk::SystemError& e) {
+            if (!current_host_visible) {
+                attempted_non_host_visible = true;
+            }
             // loop and retry
             // during last attempt throw the exception
             if (it + 1 == req_flags_list.end()) {
@@ -2051,6 +2064,15 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     if (!buf->device_memory) {
         device->device.destroyBuffer(buf->buffer);
         throw vk::OutOfDeviceMemoryError("No suitable memory type found");
+    }
+
+    if (fallback_to_host_visible) {
+        std::cerr << "ggml_vulkan: Falling back to host-visible memory for allocation of size "
+                  << size << " on " << device->name;
+        if (device->properties.deviceName[0] != '\0') {
+            std::cerr << " (" << device->properties.deviceName << ")";
+        }
+        std::cerr << "." << std::endl;
     }
 
     buf->ptr = nullptr;
@@ -2094,6 +2116,14 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
         } else if (device->disable_host_visible_vidmem) {
             if (device->allow_sysmem_fallback) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
+                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+            } else {
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+            }
+        } else if (device->architecture == vk_device_architecture::AMD_GCN && !device->uma) {
+            if (device->allow_sysmem_fallback) {
+                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
+                                                           vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
             } else {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});

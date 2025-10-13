@@ -413,6 +413,12 @@ Finally, after finishing your build, you should be able to do something like thi
 # ggml_vulkan: Using Intel(R) Graphics (ADL GT2) | uma: 1 | fp16: 1 | warp size: 32
 ```
 
+> [!NOTE]
+> On AMD GCN GPUs (for example, the RX 580) the Vulkan backend now prefers allocating buffers from pure device-local VRAM.
+> When this exhausts VRAM you will see a log indicating that allocation has fallen back to host-visible memory. If you need the
+> previous behaviour where host-visible memory is allowed as a fallback by default, set `GGML_VK_ALLOW_SYSMEM_FALLBACK=1` before
+> launching the application.
+
 ## CANN
 This provides NPU acceleration using the AI cores of your Ascend NPU. And [CANN](https://www.hiascend.com/en/software/cann) is a hierarchical APIs to help you to quickly build AI applications and service based on Ascend NPU.
 
