@@ -12019,11 +12019,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    const bool is_amd_gcn = ctx->device->architecture == vk_device_architecture::AMD_GCN;
+    int nodes_per_submit = is_amd_gcn ? 40 : 100;
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
-    uint64_t mul_mat_bytes_per_submit = std::min(uint64_t(100*1000*1000), total_mat_mul_bytes / 40u);
+    uint64_t mul_mat_bytes_per_submit = 0;
+    const uint64_t mul_mat_bytes_cap = is_amd_gcn ? uint64_t(48) * 1000 * 1000 : uint64_t(100) * 1000 * 1000;
+    if (total_mat_mul_bytes == 0) {
+        mul_mat_bytes_per_submit = 0;
+    } else if (is_amd_gcn) {
+        const uint64_t scaled_bytes = total_mat_mul_bytes / 64u;
+        const uint64_t minimum_bytes = uint64_t(12) * 1000 * 1000;
+        mul_mat_bytes_per_submit = std::min(mul_mat_bytes_cap, std::max(minimum_bytes, scaled_bytes));
+    } else {
+        mul_mat_bytes_per_submit = std::min(mul_mat_bytes_cap, total_mat_mul_bytes / 40u);
+    }
+    const int submit_growth_limit = is_amd_gcn ? 5 : 3;
+    const uint32_t submit_growth_num = is_amd_gcn ? 3 : 2;
+    const uint32_t submit_growth_den = is_amd_gcn ? 2 : 1;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {
             submit_node_idx = i;
@@ -12079,8 +12093,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             first_node_in_batch = true;
             submitted_nodes = 0;
             mul_mat_bytes = 0;
-            if (submit_count < 3) {
-                mul_mat_bytes_per_submit *= 2;
+            if (submit_count < submit_growth_limit) {
+                mul_mat_bytes_per_submit = mul_mat_bytes_per_submit * submit_growth_num / submit_growth_den;
             }
             submit_count++;
         }
