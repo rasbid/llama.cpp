@@ -2319,6 +2319,14 @@ static const std::unordered_map<std::string, uint32_t> rdna1_pipelines = {
     {"mul_mat_vec_f16", 32}, {"mul_mat_vec_f32_f16", 32}
 };
 
+// Pipeline configuration for GCN GPUs.
+static const std::unordered_map<std::string, uint32_t> gcn_pipelines = {
+    {"soft_max_back", 64}, {"soft_max", 64},
+    {"mul_mat_vec", 64}, {"mul_mat", 64},
+    {"argmax", 64}, {"sum_rows", 64},
+    {"im2col", 64}, {"flash_attn", 64},
+};
+
 // Pipeline configuration for RDNA2 GPUs.
 static const std::unordered_map<std::string, uint32_t> rdna2_pipelines = {
     {"soft_max", 64}, {"im2col", 64},
@@ -2328,6 +2336,13 @@ static constexpr uint32_t RDNA_DEFAULT_SUBGROUP_SIZE = 32;
 
 // Define configurations for different GPUs.
 static std::vector<GpuPipelineConfig> gpu_pipeline_configs = {
+    {
+        vk_device_architecture::AMD_GCN,
+        {
+            gcn_pipelines,
+        },
+        64,
+    },
     {
         vk_device_architecture::AMD_RDNA1,
         {
