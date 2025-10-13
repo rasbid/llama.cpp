@@ -597,6 +597,7 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
+    bool gcn_host_visible_override;
 
 #ifdef GGML_VULKAN_MEMORY_DEBUG
     std::unique_ptr<vk_memory_logger> memory_logger;
@@ -2025,6 +2026,8 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
     vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
 
+    const bool initial_request_host_visible = (*req_flags_list.begin() & vk::MemoryPropertyFlagBits::eHostVisible) == vk::MemoryPropertyFlagBits::eHostVisible;
+
     for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
         const auto & req_flags = *it;
 
@@ -2037,6 +2040,12 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
 
         try {
             buf->device_memory = device->device.allocateMemory({ mem_req.size, memory_type_index });
+            if (!initial_request_host_visible &&
+                (req_flags & vk::MemoryPropertyFlagBits::eHostVisible) == vk::MemoryPropertyFlagBits::eHostVisible &&
+                it != req_flags_list.begin()) {
+                std::cerr << "ggml_vulkan: Falling back to host-visible memory for allocation of size "
+                          << mem_req.size << " on " << device->name << std::endl;
+            }
             break;
         } catch (const vk::SystemError& e) {
             // loop and retry
@@ -2083,6 +2092,8 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
+    const bool prefer_device_local_only =
+        device->architecture == vk_device_architecture::AMD_GCN && !device->uma && !device->gcn_host_visible_override;
     try {
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
@@ -2099,14 +2110,23 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
                 buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
             }
         } else {
-            // use rebar if available, otherwise fallback to device only visible memory
-            if (device->allow_sysmem_fallback) {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+            if (prefer_device_local_only) {
+                if (device->allow_sysmem_fallback) {
+                    buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
+                                                               vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                } else {
+                    buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+                }
             } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
+                // use rebar if available, otherwise fallback to device only visible memory
+                if (device->allow_sysmem_fallback) {
+                    buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                                                               vk::MemoryPropertyFlagBits::eDeviceLocal,
+                                                               vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                } else {
+                    buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                                                               vk::MemoryPropertyFlagBits::eDeviceLocal});
+                }
             }
         }
     } catch (const vk::SystemError& e) {
@@ -3692,6 +3712,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM = getenv("GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM");
         device->disable_host_visible_vidmem = GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM != nullptr;
+
+        const char* GGML_VK_GCN_HOST_VISIBLE = getenv("GGML_VK_GCN_HOST_VISIBLE");
+        device->gcn_host_visible_override = GGML_VK_GCN_HOST_VISIBLE != nullptr;
 
         const char* GGML_VK_ALLOW_SYSMEM_FALLBACK = getenv("GGML_VK_ALLOW_SYSMEM_FALLBACK");
         device->allow_sysmem_fallback = GGML_VK_ALLOW_SYSMEM_FALLBACK != nullptr;
