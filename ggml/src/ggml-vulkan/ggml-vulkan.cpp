@@ -3857,13 +3857,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
             device->shader_core_count = amd_shader_core_properties2_props.activeComputeUnitCount;
-        } else if (amd_shader_core_properties) {
-            // Fallback to VK_AMD_shader_core_properties if available
-            device->shader_core_count = shader_core_props_amd.shaderEngineCount * 
-                                       shader_core_props_amd.shaderArraysPerEngineCount * 
-                                       shader_core_props_amd.computeUnitsPerShaderArray;
         } else {
-            // Final fallback: use known specs for common AMD GPUs
+            // Fallback: use known specs for common AMD GPUs when extensions are missing
             std::string device_name = device->properties.deviceName;
             if (device_name.find("RX 580") != std::string::npos || 
                 device_name.find("Polaris") != std::string::npos ||
