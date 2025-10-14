@@ -6503,7 +6503,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             // For GCN architecture, use shader core count to optimize workgroup distribution
             // Target: utilize all 36 CUs efficiently for large operations
             const uint32_t target_workgroups = ctx->device->shader_core_count * 4; // 4 workgroups per CU
-            groups_z = std::min(64u, CEIL_DIV(ne01, target_workgroups));
+            groups_z = std::min(64u, (uint32_t)CEIL_DIV(ne01, target_workgroups));
             groups_x = CEIL_DIV(ne01, groups_z);
         } else {
             // Fallback to original logic
@@ -7168,7 +7168,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
             // For GCN architecture, use shader core count to optimize workgroup distribution
             // Target: utilize all 36 CUs efficiently for large operations
             const uint32_t target_workgroups = ctx->device->shader_core_count * 4; // 4 workgroups per CU
-            groups_z = std::min(64u, CEIL_DIV(ne01, target_workgroups));
+            groups_z = std::min(64u, (uint32_t)CEIL_DIV(ne01, target_workgroups));
             groups_x = CEIL_DIV(ne01, groups_z);
         } else {
             // Fallback to original logic
