@@ -6498,8 +6498,18 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     uint32_t groups_z = 1;
 
     if (ne01 > max_groups_x) {
-        groups_z = 64;
-        groups_x = CEIL_DIV(groups_x, groups_z);
+        // Optimize workgroup distribution for large matrices (like vocab projection)
+        if (ctx->device->architecture == vk_device_architecture::AMD_GCN && ctx->device->shader_core_count > 0) {
+            // For GCN architecture, use shader core count to optimize workgroup distribution
+            // Target: utilize all 36 CUs efficiently for large operations
+            const uint32_t target_workgroups = ctx->device->shader_core_count * 4; // 4 workgroups per CU
+            groups_z = std::min(64u, CEIL_DIV(ne01, target_workgroups));
+            groups_x = CEIL_DIV(ne01, groups_z);
+        } else {
+            // Fallback to original logic
+            groups_z = 64;
+            groups_x = CEIL_DIV(groups_x, groups_z);
+        }
     }
 
     // TODO: Clean up this whole sz * ne_2 * ne_3 thing, it hasn't been necessary for a long time
@@ -7153,8 +7163,18 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     uint32_t groups_z = 1;
 
     if (ne01 > max_groups_x) {
-        groups_z = 64;
-        groups_x = CEIL_DIV(groups_x, groups_z);
+        // Optimize workgroup distribution for large matrices (like vocab projection)
+        if (ctx->device->architecture == vk_device_architecture::AMD_GCN && ctx->device->shader_core_count > 0) {
+            // For GCN architecture, use shader core count to optimize workgroup distribution
+            // Target: utilize all 36 CUs efficiently for large operations
+            const uint32_t target_workgroups = ctx->device->shader_core_count * 4; // 4 workgroups per CU
+            groups_z = std::min(64u, CEIL_DIV(ne01, target_workgroups));
+            groups_x = CEIL_DIV(ne01, groups_z);
+        } else {
+            // Fallback to original logic
+            groups_z = 64;
+            groups_x = CEIL_DIV(groups_x, groups_z);
+        }
     }
 
     // compute
