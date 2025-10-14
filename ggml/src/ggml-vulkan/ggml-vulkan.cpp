@@ -257,7 +257,26 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             }
         }
 
+        // Fallback detection for older AMD drivers (like RADV on RX-580)
+        // that don't have all required extensions
         if (!amd_shader_core_properties || !integer_dot_product || !subgroup_size_control) {
+            // Use device name and basic properties for fallback detection
+            std::string device_name = props.deviceName;
+            
+            // RX-580 specific detection (Polaris/GCN 4.0)
+            if (device_name.find("RX 580") != std::string::npos || 
+                device_name.find("Polaris") != std::string::npos ||
+                (props.deviceID >= 0x67DF && props.deviceID <= 0x67FF)) { // Polaris device IDs
+                return vk_device_architecture::AMD_GCN;
+            }
+            
+            // RDNA detection fallback
+            if (device_name.find("RX 6") != std::string::npos || 
+                device_name.find("RDNA") != std::string::npos) {
+                // Default to RDNA2 for newer architectures
+                return vk_device_architecture::AMD_RDNA2;
+            }
+            
             return vk_device_architecture::OTHER;
         }
 
@@ -3114,7 +3133,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
         rm_stdq = 2;
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    // Enable subgroup operations for GCN when wave64 is guaranteed (subgroup size = 64)
+    const bool use_subgroups = device->subgroup_arithmetic && 
+                              (device->architecture != vk_device_architecture::AMD_GCN || 
+                               (device->architecture == vk_device_architecture::AMD_GCN && device->subgroup_size == 64));
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
@@ -3835,8 +3857,30 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
             device->shader_core_count = amd_shader_core_properties2_props.activeComputeUnitCount;
+        } else if (amd_shader_core_properties) {
+            // Fallback to VK_AMD_shader_core_properties if available
+            device->shader_core_count = shader_core_props_amd.shaderEngineCount * 
+                                       shader_core_props_amd.shaderArraysPerEngineCount * 
+                                       shader_core_props_amd.computeUnitsPerShaderArray;
         } else {
-            device->shader_core_count = 0;
+            // Final fallback: use known specs for common AMD GPUs
+            std::string device_name = device->properties.deviceName;
+            if (device_name.find("RX 580") != std::string::npos || 
+                device_name.find("Polaris") != std::string::npos ||
+                (device->properties.deviceID >= 0x67DF && device->properties.deviceID <= 0x67FF)) {
+                // RX-580: 36 CUs
+                device->shader_core_count = 36;
+            } else if (device_name.find("RX 570") != std::string::npos ||
+                       (device->properties.deviceID >= 0x67EF && device->properties.deviceID <= 0x67FF)) {
+                // RX-570: 32 CUs
+                device->shader_core_count = 32;
+            } else if (device_name.find("RX 560") != std::string::npos ||
+                       (device->properties.deviceID >= 0x67FF && device->properties.deviceID <= 0x67FF)) {
+                // RX-560: 16 CUs
+                device->shader_core_count = 16;
+            } else {
+                device->shader_core_count = 0;
+            }
         }
         device->float_controls_rte_fp16 = vk12_props.shaderRoundingModeRTEFloat16;
 
