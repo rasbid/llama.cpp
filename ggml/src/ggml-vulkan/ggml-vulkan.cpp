@@ -7153,8 +7153,30 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     uint32_t groups_z = 1;
 
     if (ne01 > max_groups_x) {
-        groups_z = 64;
-        groups_x = CEIL_DIV(groups_x, groups_z);
+        // Optimize workgroup distribution for MoE operations
+        if (ctx->device->architecture == vk_device_architecture::AMD_GCN && ctx->device->shader_core_count > 0) {
+            // For MoE operations, optimize based on expert count and GCN architecture
+            // Target: utilize all 36 CUs efficiently for expert operations
+            const uint32_t expert_count = nei0;
+            const uint32_t target_workgroups = ctx->device->shader_core_count * 2; // 2 workgroups per CU for MoE
+            
+            // For MoE operations, we want to distribute work across experts efficiently
+            // This optimizes both expert selection (MUL_MAT_ID_VEC m=2048 n=8 k=768) 
+            // and expert computation (MUL_MAT_ID_VEC m=768 n=8 k=2048) operations
+            if (expert_count <= 8) {
+                // Small expert count: use smaller groups_z for better expert parallelism
+                // This improves subgroup-based expert selection efficiency
+                groups_z = std::min(32u, (uint32_t)CEIL_DIV(ne01, target_workgroups));
+            } else {
+                // Larger expert count: use standard optimization
+                groups_z = std::min(64u, (uint32_t)CEIL_DIV(ne01, target_workgroups));
+            }
+            groups_x = CEIL_DIV(ne01, groups_z);
+        } else {
+            // Fallback to original logic
+            groups_z = 64;
+            groups_x = CEIL_DIV(groups_x, groups_z);
+        }
     }
 
     // compute
