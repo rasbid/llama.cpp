@@ -1034,7 +1034,13 @@ private:
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
-            mparams.flash_attn_type  = params_base.flash_attn_type;
+            // Vision tower FA stays independent of the text model's -fa flag:
+            // without FA the ViT attention materializes n^2 f32 tensors that
+            // exceed Vulkan buffer limits on large images and silently fall
+            // back to CPU. AUTO lets clip pick FA when the backend supports it.
+            mparams.flash_attn_type  = params_base.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED
+                                           ? LLAMA_FLASH_ATTN_TYPE_AUTO
+                                           : params_base.flash_attn_type;
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
