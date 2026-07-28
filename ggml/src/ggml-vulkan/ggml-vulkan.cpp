@@ -15744,10 +15744,13 @@ static const char * ggml_backend_vk_name(ggml_backend_t backend) {
     return ctx->name.c_str();
 }
 
+static void ggml_vk_p2p_free_channels(ggml_backend_vk_context * ctx);
+
 static void ggml_backend_vk_free(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
     VK_LOG_DEBUG("ggml_backend_vk_free(" << ctx->name << ")");
 
+    ggml_vk_p2p_free_channels(ctx);
     ggml_vk_cleanup(ctx);
 
     delete ctx;
@@ -15879,6 +15882,281 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+// Cross-device async copy ("p2p"): routes GPU->GPU copies through a host
+// staging ring imported into both devices via VK_EXT_external_memory_host.
+// Cross-device queue ordering is relayed through host-signaled timeline
+// semaphores on a worker thread, so the calling (scheduler) thread never
+// blocks and split compute can overlap across devices.
+struct vk_p2p_job {
+    vk::Device wait_dev;
+    vk::Semaphore wait_sem;
+    uint64_t wait_val;
+    vk::Device sig_dev;
+    vk::Semaphore sig_sem;
+    uint64_t sig_val;
+};
+
+static constexpr uint32_t VK_P2P_SLOTS = 8;
+
+struct vk_p2p_channel {
+    void * host_mem = nullptr;
+    size_t slot_size = 0;
+    vk_buffer src_buf;
+    vk_buffer dst_buf;
+    vk::Device src_dev;
+    vk::Device dst_dev;
+    vk::Semaphore src_done;  // src device timeline, signaled by src queue after a staging write
+    vk::Semaphore dst_ready; // dst device timeline, host-signaled when staging is readable
+    vk::Semaphore src_gate;  // src device timeline, host-signaled when a slot may be overwritten
+    vk::Semaphore dst_done;  // dst device timeline, signaled by dst queue after a staging read
+    uint64_t src_done_value = 0;
+    uint64_t dst_ready_value = 0;
+    uint64_t src_gate_value = 0;
+    uint64_t dst_done_value = 0;
+    uint64_t slot_dst_done[VK_P2P_SLOTS] = {};
+    uint32_t next_slot = 0;
+
+    ~vk_p2p_channel() {
+        if (src_buf != nullptr) {
+            ggml_vk_destroy_buffer(src_buf);
+        }
+        if (dst_buf != nullptr) {
+            ggml_vk_destroy_buffer(dst_buf);
+        }
+        if (src_done)  { src_dev.destroySemaphore(src_done);  }
+        if (src_gate)  { src_dev.destroySemaphore(src_gate);  }
+        if (dst_ready) { dst_dev.destroySemaphore(dst_ready); }
+        if (dst_done)  { dst_dev.destroySemaphore(dst_done);  }
+        if (host_mem)  { free(host_mem); }
+    }
+};
+
+static std::mutex p2p_mutex;
+static std::condition_variable p2p_cv;
+static std::condition_variable p2p_idle_cv;
+static std::deque<vk_p2p_job> p2p_jobs;
+static bool p2p_worker_running = false;
+static bool p2p_worker_busy = false;
+static std::map<std::pair<void *, void *>, std::unique_ptr<vk_p2p_channel>> p2p_channels;
+
+static void ggml_vk_p2p_worker() {
+    std::unique_lock<std::mutex> lock(p2p_mutex);
+    for (;;) {
+        p2p_cv.wait(lock, [] { return !p2p_jobs.empty(); });
+        vk_p2p_job job = p2p_jobs.front();
+        p2p_jobs.pop_front();
+        p2p_worker_busy = true;
+        lock.unlock();
+
+        if (job.wait_val > 0) {
+            vk::SemaphoreWaitInfo wait_info{ {}, 1, &job.wait_sem, &job.wait_val };
+            vk::Result res = job.wait_dev.waitSemaphores(wait_info, UINT64_MAX);
+            if (res != vk::Result::eSuccess) {
+                GGML_LOG_ERROR("ggml_vulkan: p2p waitSemaphores failed (%d)\n", (int)res);
+            }
+        }
+        vk::SemaphoreSignalInfo sig_info{ job.sig_sem, job.sig_val };
+        job.sig_dev.signalSemaphore(sig_info);
+
+        lock.lock();
+        p2p_worker_busy = false;
+        if (p2p_jobs.empty()) {
+            p2p_idle_cv.notify_all();
+        }
+    }
+}
+
+static void ggml_vk_p2p_enqueue(const vk_p2p_job & job) {
+    std::lock_guard<std::mutex> lock(p2p_mutex);
+    if (!p2p_worker_running) {
+        std::thread(ggml_vk_p2p_worker).detach();
+        p2p_worker_running = true;
+    }
+    p2p_jobs.push_back(job);
+    p2p_cv.notify_one();
+}
+
+// Wait until the relay worker has no queued or in-flight jobs.
+static void ggml_vk_p2p_drain() {
+    std::unique_lock<std::mutex> lock(p2p_mutex);
+    p2p_idle_cv.wait(lock, [] { return p2p_jobs.empty() && !p2p_worker_busy; });
+}
+
+static vk::Semaphore ggml_vk_p2p_create_timeline_semaphore(vk::Device dev) {
+    vk::SemaphoreTypeCreateInfo type_info{ vk::SemaphoreType::eTimeline, 0 };
+    vk::SemaphoreCreateInfo info{};
+    info.pNext = &type_info;
+    return dev.createSemaphore(info);
+}
+
+// Wait on the host for all submitted GPU work of a channel to complete.
+static void ggml_vk_p2p_wait_channel_idle(vk_p2p_channel * ch) {
+    if (ch->src_done_value > 0) {
+        vk::SemaphoreWaitInfo wi{ {}, 1, &ch->src_done, &ch->src_done_value };
+        (void)ch->src_dev.waitSemaphores(wi, UINT64_MAX);
+    }
+    if (ch->dst_done_value > 0) {
+        vk::SemaphoreWaitInfo wi{ {}, 1, &ch->dst_done, &ch->dst_done_value };
+        (void)ch->dst_dev.waitSemaphores(wi, UINT64_MAX);
+    }
+}
+
+static vk_p2p_channel * ggml_vk_p2p_get_channel(ggml_backend_vk_context * src_ctx, ggml_backend_vk_context * dst_ctx, size_t size) {
+    const std::pair<void *, void *> key{ src_ctx, dst_ctx };
+    vk_p2p_channel * existing = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(p2p_mutex);
+        auto it = p2p_channels.find(key);
+        if (it != p2p_channels.end()) {
+            existing = it->second.get();
+        }
+    }
+    if (existing != nullptr && existing->slot_size >= size) {
+        return existing;
+    }
+
+    // First copy for this pair, or a copy larger than the current slots:
+    // quiesce and (re)build the channel. This is rare — the first (reserve)
+    // graph runs the largest ubatch, so steady state never lands here.
+    ggml_vk_p2p_drain();
+    if (existing != nullptr) {
+        ggml_vk_p2p_wait_channel_idle(existing);
+    }
+
+    vk_device & src_dev = src_ctx->device;
+    vk_device & dst_dev = dst_ctx->device;
+
+    const size_t align = std::max<size_t>({ (size_t)src_dev->min_imported_host_pointer_alignment,
+                                            (size_t)dst_dev->min_imported_host_pointer_alignment, 4096 });
+    auto channel = std::make_unique<vk_p2p_channel>();
+    channel->slot_size = ggml_vk_align_size(size, align);
+    const size_t total = channel->slot_size * VK_P2P_SLOTS;
+
+    if (posix_memalign(&channel->host_mem, align, total) != 0) {
+        channel->host_mem = nullptr;
+        GGML_LOG_WARN("ggml_vulkan: p2p staging allocation failed (%zu bytes)\n", total);
+        return nullptr;
+    }
+
+    try {
+        channel->src_buf = ggml_vk_create_buffer(src_dev, total,
+            { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent }, channel->host_mem);
+        channel->dst_buf = ggml_vk_create_buffer(dst_dev, total,
+            { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent }, channel->host_mem);
+    } catch (const vk::SystemError & e) {
+        GGML_LOG_WARN("ggml_vulkan: p2p staging import failed (%s)\n", e.what());
+        return nullptr;
+    }
+    if (channel->src_buf == nullptr || channel->dst_buf == nullptr) {
+        GGML_LOG_WARN("ggml_vulkan: p2p staging import not usable, falling back to sync copies\n");
+        return nullptr;
+    }
+
+    channel->src_dev = src_dev->device;
+    channel->dst_dev = dst_dev->device;
+    channel->src_done  = ggml_vk_p2p_create_timeline_semaphore(src_dev->device);
+    channel->src_gate  = ggml_vk_p2p_create_timeline_semaphore(src_dev->device);
+    channel->dst_ready = ggml_vk_p2p_create_timeline_semaphore(dst_dev->device);
+    channel->dst_done  = ggml_vk_p2p_create_timeline_semaphore(dst_dev->device);
+
+    GGML_LOG_DEBUG("ggml_vulkan: p2p channel %s -> %s, %u slots x %zu bytes\n",
+                   src_ctx->name.c_str(), dst_ctx->name.c_str(), VK_P2P_SLOTS, channel->slot_size);
+
+    std::lock_guard<std::mutex> lock(p2p_mutex);
+    auto & entry = p2p_channels[key];
+    entry = std::move(channel);
+    return entry.get();
+}
+
+static void ggml_vk_p2p_free_channels(ggml_backend_vk_context * ctx) {
+    ggml_vk_p2p_drain();
+    std::lock_guard<std::mutex> lock(p2p_mutex);
+    for (auto it = p2p_channels.begin(); it != p2p_channels.end(); ) {
+        if (it->first.first == ctx || it->first.second == ctx) {
+            ggml_vk_p2p_wait_channel_idle(it->second.get());
+            it = p2p_channels.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static bool ggml_backend_vk_p2p_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    static const bool p2p_disabled = getenv("GGML_VK_DISABLE_P2P") != nullptr;
+    if (p2p_disabled || !ggml_backend_is_vk(backend_src)) {
+        return false;
+    }
+
+    ggml_backend_vk_context * src_ctx = (ggml_backend_vk_context *)backend_src->context;
+    ggml_backend_vk_context * dst_ctx = (ggml_backend_vk_context *)backend_dst->context;
+
+    if (!src_ctx->device->external_memory_host || !dst_ctx->device->external_memory_host) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
+    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+    vk_buffer src_buf = src_buf_ctx->dev_buffer;
+    vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+
+    const size_t size = ggml_nbytes(src);
+
+    vk_p2p_channel * ch = ggml_vk_p2p_get_channel(src_ctx, dst_ctx, size);
+    if (ch == nullptr) {
+        return false;
+    }
+
+    const uint32_t slot = ch->next_slot++ % VK_P2P_SLOTS;
+    const size_t slot_offset = (size_t)slot * ch->slot_size;
+
+    // Gate: the src queue may only overwrite this slot once the dst queue is
+    // done reading the slot's previous contents.
+    const uint64_t gate_val = ++ch->src_gate_value;
+    ggml_vk_p2p_enqueue({ ch->dst_dev, ch->dst_done, ch->slot_dst_done[slot], ch->src_dev, ch->src_gate, gate_val });
+
+    // Src queue: staging write, ordered after the producing compute by a
+    // cross-submission pipeline barrier on the same queue.
+    vk_context src_subctx = ggml_vk_create_context(src_ctx, src_ctx->compute_cmd_pool);
+    ggml_vk_ctx_begin(src_ctx->device, src_subctx);
+    {
+        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT };
+        vkCmdPipelineBarrier(src_subctx->s->buffer->buf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+        VkBufferCopy bc{ vk_tensor_offset(src) + src->view_offs, slot_offset, size };
+        vkCmdCopyBuffer(src_subctx->s->buffer->buf, (VkBuffer)src_buf->buffer, (VkBuffer)ch->src_buf->buffer, 1, &bc);
+    }
+    ggml_vk_ctx_end(src_subctx);
+    src_subctx->seqs.back().back().wait_semaphores.push_back({ ch->src_gate, gate_val });
+    const uint64_t src_done_val = ++ch->src_done_value;
+    src_subctx->seqs.back().back().signal_semaphores.push_back({ ch->src_done, src_done_val });
+    ggml_vk_submit(src_subctx, {});
+    src_ctx->submit_pending = true;
+
+    // Relay: once the staging write completes, allow the dst queue to proceed.
+    const uint64_t ready_val = ++ch->dst_ready_value;
+    ggml_vk_p2p_enqueue({ ch->src_dev, ch->src_done, src_done_val, ch->dst_dev, ch->dst_ready, ready_val });
+
+    // Dst queue: staging read into the destination tensor. The barrier orders
+    // it against all later compute in submission order on this queue.
+    vk_context dst_subctx = ggml_vk_get_compute_ctx(dst_ctx);
+    dst_subctx->s->wait_semaphores.push_back({ ch->dst_ready, ready_val });
+    {
+        VkBufferCopy bc{ slot_offset, vk_tensor_offset(dst) + dst->view_offs, size };
+        vkCmdCopyBuffer(dst_subctx->s->buffer->buf, (VkBuffer)ch->dst_buf->buffer, (VkBuffer)dst_buf->buffer, 1, &bc);
+        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT };
+        vkCmdPipelineBarrier(dst_subctx->s->buffer->buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    const uint64_t done_val = ++ch->dst_done_value;
+    dst_subctx->s->signal_semaphores.push_back({ ch->dst_done, done_val });
+    ch->slot_dst_done[slot] = done_val;
+
+    return true;
+}
+
 static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
@@ -15898,9 +16176,8 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     if (ggml_backend_buffer_is_vk(src->buffer)) {
         ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
 
-        // Async copy only works within the same device
         if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
-            return false;
+            return ggml_backend_vk_p2p_cpy_tensor_async(backend_src, backend_dst, src, dst);
         }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
