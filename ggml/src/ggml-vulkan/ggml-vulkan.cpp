@@ -15931,38 +15931,68 @@ struct vk_p2p_channel {
     }
 };
 
-static std::mutex p2p_mutex;
-static std::condition_variable p2p_cv;
-static std::condition_variable p2p_idle_cv;
-static std::deque<vk_p2p_job> p2p_jobs;
+// Intentionally leaked: the relay worker is a detached thread that may still
+// reference these during process exit, so they must never be destroyed.
+static std::mutex & p2p_mutex = *new std::mutex();
+static std::condition_variable & p2p_cv = *new std::condition_variable();
+static std::condition_variable & p2p_idle_cv = *new std::condition_variable();
+static std::deque<vk_p2p_job> & p2p_jobs = *new std::deque<vk_p2p_job>();
 static bool p2p_worker_running = false;
 static bool p2p_worker_busy = false;
-static std::map<std::pair<void *, void *>, std::unique_ptr<vk_p2p_channel>> p2p_channels;
+static std::map<std::pair<void *, void *>, std::unique_ptr<vk_p2p_channel>> & p2p_channels =
+    *new std::map<std::pair<void *, void *>, std::unique_ptr<vk_p2p_channel>>();
+
+// Relay loop: jobs are grouped per signal semaphore so signals stay monotonic,
+// but different semaphores progress independently — a single blocking FIFO
+// would head-of-line block the pipeline (a relay for a finished early stage
+// would sit behind relays still waiting on later stages). Readiness is polled
+// with adaptive backoff; the backoff cap is negligible against stage times.
+static std::map<VkSemaphore, std::deque<vk_p2p_job>> & p2p_pending = *new std::map<VkSemaphore, std::deque<vk_p2p_job>>();
 
 static void ggml_vk_p2p_worker() {
+    std::chrono::microseconds backoff(50);
     std::unique_lock<std::mutex> lock(p2p_mutex);
     for (;;) {
-        p2p_cv.wait(lock, [] { return !p2p_jobs.empty(); });
-        vk_p2p_job job = p2p_jobs.front();
-        p2p_jobs.pop_front();
-        p2p_worker_busy = true;
-        lock.unlock();
+        while (!p2p_jobs.empty()) {
+            vk_p2p_job job = p2p_jobs.front();
+            p2p_jobs.pop_front();
+            p2p_pending[(VkSemaphore)job.sig_sem].push_back(job);
+        }
 
-        if (job.wait_val > 0) {
-            vk::SemaphoreWaitInfo wait_info{ {}, 1, &job.wait_sem, &job.wait_val };
-            vk::Result res = job.wait_dev.waitSemaphores(wait_info, UINT64_MAX);
-            if (res != vk::Result::eSuccess) {
-                GGML_LOG_ERROR("ggml_vulkan: p2p waitSemaphores failed (%d)\n", (int)res);
+        bool progressed = false;
+        for (auto it = p2p_pending.begin(); it != p2p_pending.end(); ) {
+            auto & dq = it->second;
+            while (!dq.empty()) {
+                vk_p2p_job & job = dq.front();
+                if (job.wait_val > 0) {
+                    uint64_t counter = 0;
+                    vk::Result res = job.wait_dev.getSemaphoreCounterValue(job.wait_sem, &counter);
+                    if (res != vk::Result::eSuccess) {
+                        GGML_LOG_ERROR("ggml_vulkan: p2p getSemaphoreCounterValue failed (%d)\n", (int)res);
+                    }
+                    if (counter < job.wait_val) {
+                        break;
+                    }
+                }
+                vk::SemaphoreSignalInfo sig_info{ job.sig_sem, job.sig_val };
+                job.sig_dev.signalSemaphore(sig_info);
+                dq.pop_front();
+                progressed = true;
             }
+            it = dq.empty() ? p2p_pending.erase(it) : std::next(it);
         }
-        vk::SemaphoreSignalInfo sig_info{ job.sig_sem, job.sig_val };
-        job.sig_dev.signalSemaphore(sig_info);
 
-        lock.lock();
-        p2p_worker_busy = false;
-        if (p2p_jobs.empty()) {
+        if (p2p_jobs.empty() && p2p_pending.empty()) {
+            p2p_worker_busy = false;
             p2p_idle_cv.notify_all();
+            p2p_cv.wait(lock, [] { return !p2p_jobs.empty(); });
+            p2p_worker_busy = true;
+            backoff = std::chrono::microseconds(50);
+            continue;
         }
+
+        backoff = progressed ? std::chrono::microseconds(50) : std::min(backoff * 2, std::chrono::microseconds(2000));
+        p2p_cv.wait_for(lock, backoff);
     }
 }
 
@@ -15976,10 +16006,10 @@ static void ggml_vk_p2p_enqueue(const vk_p2p_job & job) {
     p2p_cv.notify_one();
 }
 
-// Wait until the relay worker has no queued or in-flight jobs.
+// Wait until the relay worker has no queued, pending, or in-flight jobs.
 static void ggml_vk_p2p_drain() {
     std::unique_lock<std::mutex> lock(p2p_mutex);
-    p2p_idle_cv.wait(lock, [] { return p2p_jobs.empty() && !p2p_worker_busy; });
+    p2p_idle_cv.wait(lock, [] { return p2p_jobs.empty() && p2p_pending.empty() && !p2p_worker_busy; });
 }
 
 static vk::Semaphore ggml_vk_p2p_create_timeline_semaphore(vk::Device dev) {
