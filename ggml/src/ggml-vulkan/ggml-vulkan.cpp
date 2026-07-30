@@ -15950,6 +15950,14 @@ static std::map<std::pair<void *, void *>, std::unique_ptr<vk_p2p_channel>> & p2
 static std::map<VkSemaphore, std::deque<vk_p2p_job>> & p2p_pending = *new std::map<VkSemaphore, std::deque<vk_p2p_job>>();
 
 static void ggml_vk_p2p_worker() {
+    // Backoff cap bounds the semaphore-detection latency added to each
+    // cross-device boundary. 100us measured best for single-token decode on
+    // gfx803 (18.3 -> 20.6 t/s) with no prompt-processing cost.
+    static const long max_backoff_us = [] {
+        const char * s = getenv("GGML_VK_P2P_MAX_BACKOFF_US");
+        long v = s ? atol(s) : 100;
+        return v > 0 ? v : 100;
+    }();
     std::chrono::microseconds backoff(50);
     std::unique_lock<std::mutex> lock(p2p_mutex);
     for (;;) {
@@ -15991,7 +15999,7 @@ static void ggml_vk_p2p_worker() {
             continue;
         }
 
-        backoff = progressed ? std::chrono::microseconds(50) : std::min(backoff * 2, std::chrono::microseconds(2000));
+        backoff = progressed ? std::chrono::microseconds(50) : std::min(backoff * 2, std::chrono::microseconds(max_backoff_us));
         p2p_cv.wait_for(lock, backoff);
     }
 }
