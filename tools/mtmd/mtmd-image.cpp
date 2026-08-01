@@ -895,11 +895,35 @@ mtmd_image_preproc_out mtmd_image_preprocessor_dyn_size::preprocess(const clip_i
     const clip_image_size original_size = img.get_size();
     // the original pixtral model doesn't have n_merge
     const int cur_merge = hparams.n_merge;
-    const clip_image_size target_size = img_tool::calc_size_preserved_ratio(
+    clip_image_size target_size = img_tool::calc_size_preserved_ratio(
         original_size,
         hparams.patch_size * cur_merge,
         hparams.image_min_pixels,
         hparams.image_max_pixels);
+
+    // Flash attention selects a ~3x slower bounds-checked variant when the
+    // patch count does not divide the attention block size (measured on
+    // gfx803: 62s vs 22.6s for a 4MP encode). Snapping each side to an
+    // 8-patch multiple makes the product divide 64 at a <2% resolution
+    // change; gated to large images where attention dominates.
+    static const bool snap_patches = getenv("CLIP_SNAP_PATCHES") != nullptr;
+    if (snap_patches) {
+        const int snap_px = hparams.patch_size * 8;
+        const int64_t px = (int64_t) target_size.width * target_size.height;
+        const int64_t n_patches = (int64_t) (target_size.width / hparams.patch_size) * (target_size.height / hparams.patch_size);
+        if (snap_px > 0 && px >= 2000000 && n_patches % 64 != 0) {
+            auto snap_round = [&](int v) { return std::max(snap_px, (int) std::llround(v / (double) snap_px) * snap_px); };
+            auto snap_floor = [&](int v) { return std::max(snap_px, v / snap_px * snap_px); };
+            int w = snap_round(target_size.width);
+            int h = snap_round(target_size.height);
+            if ((int64_t) w * h > hparams.image_max_pixels) {
+                w = snap_floor(target_size.width);
+                h = snap_floor(target_size.height);
+            }
+            target_size.width  = w;
+            target_size.height = h;
+        }
+    }
     img_tool::resize(img, resized_image, target_size,
                         hparams.image_resize_algo,
                         hparams.image_resize_pad,
