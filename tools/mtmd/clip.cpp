@@ -706,7 +706,10 @@ ggml_tensor * clip_graph::build_attn(
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+        // F16 accumulation roughly halves the scalar FA cost on gfx803;
+        // opt-in so quality can be A/B checked per model.
+        static const bool fa_f16_acc = getenv("CLIP_FA_F16_ACC") != nullptr;
+        ggml_flash_attn_ext_set_prec(cur, fa_f16_acc ? GGML_PREC_DEFAULT : GGML_PREC_F32);
         if (sinks != nullptr) {
             ggml_flash_attn_ext_add_sinks(cur, sinks);
         }

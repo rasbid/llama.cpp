@@ -2077,6 +2077,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // an embd (image) batch reallocs the sched's graph buffers to exact-fit
+    // sizes, discarding the worst-case reservation - after which every later
+    // token ubatch reallocs again as the kq mask grows, draining the
+    // multi-GPU pipeline (text pp drops ~5x until restart). restore the
+    // worst-case token-graph reservation before the next token batch. this
+    // is the lean version of sched_reserve: one pp graph reserve, no sched
+    // rebuild.
+    if (batch_inp.embd && memory) {
+        synchronize();
+
+        const auto mctx_full = memory->init_full();
+        if (mctx_full) {
+            const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch);
+            const uint32_t n_outputs = std::max(1u, std::min(n_tokens, cparams.n_outputs_max));
+
+            if (!graph_reserve(n_tokens, cparams.n_seq_max, n_outputs, mctx_full.get(), false, nullptr)) {
+                LLAMA_LOG_WARN("%s: failed to restore worst-case reservation after embd batch\n", __func__);
+            }
+        }
+    }
+
     return 0;
 }
 

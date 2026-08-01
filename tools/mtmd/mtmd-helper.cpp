@@ -335,7 +335,7 @@ int32_t mtmd_helper_decode_image_chunk(
             }
         }
 
-        LOG_INF("%s decoded (batch %d/%d) in %" PRId64 " ms\n", name, i_batch+1, n_img_batches, ggml_time_ms() - t1);
+        LOG_WRN("%s decoded (batch %d/%d, n_tokens %d) in %" PRId64 " ms\n", name, i_batch+1, n_img_batches, n_tokens_batch, ggml_time_ms() - t1);
 
         i_batch++;
     }
