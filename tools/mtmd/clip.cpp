@@ -699,6 +699,19 @@ ggml_tensor * clip_graph::build_attn(
     if (flash_attn_type == CLIP_FLASH_ATTN_TYPE_ENABLED) {
         ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
 
+        // the scalar FA shader runs 16-multiple head sizes much faster than
+        // ragged ones (gfx803: head 72 -> 80 measured 1.5x). zero-padding
+        // q/k/v rows leaves the attention math unchanged; the output rows
+        // are sliced back below. opt-in per pod.
+        static const bool fa_pad_head = getenv("CLIP_FA_PAD_HEAD") != nullptr;
+        const int64_t d_head_orig = q->ne[0];
+        const int64_t d_pad = (fa_pad_head && d_head_orig % 16) ? 16 - d_head_orig % 16 : 0;
+        if (d_pad) {
+            q = ggml_pad(ctx0, ggml_cont(ctx0, q), d_pad, 0, 0, 0);
+            k = ggml_pad(ctx0, ggml_cont(ctx0, k), d_pad, 0, 0, 0);
+            v = ggml_pad(ctx0, ggml_cont(ctx0, v), d_pad, 0, 0, 0);
+        }
+
         k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         if (kq_mask) {
@@ -712,6 +725,11 @@ ggml_tensor * clip_graph::build_attn(
         ggml_flash_attn_ext_set_prec(cur, fa_f16_acc ? GGML_PREC_DEFAULT : GGML_PREC_F32);
         if (sinks != nullptr) {
             ggml_flash_attn_ext_add_sinks(cur, sinks);
+        }
+
+        if (d_pad) {
+            cur = ggml_cont(ctx0, ggml_view_4d(ctx0, cur, d_head_orig, cur->ne[1], cur->ne[2], cur->ne[3],
+                    cur->nb[1], cur->nb[2], cur->nb[3], 0));
         }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
