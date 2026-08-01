@@ -1328,7 +1328,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // with pipeline parallelism, reusing a graph for a multi-token ubatch
+    // forces a full sched synchronize (below) before its inputs can be
+    // rewritten, draining the pipeline on every ubatch. rebuilding instead
+    // rotates the sched's input copies and submits async (~2 ms on the CPU),
+    // so prompt-processing ubatches always take the rebuild path.
+    const bool reuse_serializes = cparams.pipeline_parallel && ubatch.n_tokens > 1;
+
+    const int64_t t_build0_us = ggml_time_us();
+    if (!graph_reuse_disable && !reuse_serializes && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1365,20 +1373,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // set the input data for the input tensors
+    const int64_t t_inp0_us = ggml_time_us();
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    const int64_t t_inp1_us = ggml_time_us();
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    if (ubatch.n_tokens > 1 && getenv("LLAMA_UB_TRACE")) {
+        LLAMA_LOG_WARN("ub_trace: %s n_tokens=%d build+alloc %.1f ms, set_inputs %.1f ms, compute_async %.1f ms\n",
+                ubatch.embd ? "embd" : "token", (int) ubatch.n_tokens,
+                (t_inp0_us - t_build0_us) / 1000.0,
+                (t_inp1_us - t_inp0_us) / 1000.0, (ggml_time_us() - t_inp1_us) / 1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;

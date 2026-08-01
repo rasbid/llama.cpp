@@ -2784,6 +2784,26 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+    bool has_embd = false;
+    for (const auto & ub : this->ubatches) {
+        if (ub.embd) {
+            has_embd = true;
+            break;
+        }
+    }
+
+    if (has_embd) {
+        // hold n_kv at the batch-end value for all ubatches (see n_kv_floor)
+        uint32_t idx_max = 0;
+        for (const auto & sinfo : this->sinfos) {
+            for (const auto & idxs : sinfo.idxs) {
+                for (uint32_t idx : idxs) {
+                    idx_max = std::max(idx_max, idx + 1);
+                }
+            }
+        }
+        n_kv_floor = std::min<uint32_t>(kv->get_size(), GGML_PAD(idx_max, 256u));
+    }
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -2809,7 +2829,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = std::max<int32_t>(kv->get_n_kv(sinfos[i_cur]), n_kv_floor);
 
     return true;
 }

@@ -441,4 +441,10 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // for batches with embd inputs (image chunks), n_kv is held at the
+    // batch-end value so that every ubatch builds an identically-sized
+    // kq mask. otherwise the mask outgrows its allocation on each ubatch
+    // and the resulting galloc realloc drains the multi-GPU pipeline.
+    uint32_t n_kv_floor = 0;
 };

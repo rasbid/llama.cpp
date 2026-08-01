@@ -993,6 +993,14 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
     }
 }
 
+
+static bool ggml_gallocr_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("LLAMA_UB_TRACE") != NULL;
+    }
+    return enabled;
+}
 static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
@@ -1002,6 +1010,11 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         }
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
+    if (talloc->size_max < node_size && ggml_gallocr_trace_enabled()) {
+        GGML_LOG_WARN("galloc_realloc: %s ne=[%d,%d,%d,%d] need %zu reserved %zu\n",
+                node->name, (int) node->ne[0], (int) node->ne[1], (int) node->ne[2], (int) node->ne[3],
+                node_size, talloc->size_max);
+    }
     return talloc->size_max >= node_size;
 }
 
@@ -1010,6 +1023,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
+        if (ggml_gallocr_trace_enabled()) {
+            GGML_LOG_WARN("galloc_realloc: n_nodes %d -> %d\n", galloc->n_nodes, graph->n_nodes);
+        }
         return true;
     }
 
@@ -1017,6 +1033,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
+        if (ggml_gallocr_trace_enabled()) {
+            GGML_LOG_WARN("galloc_realloc: n_leafs %d -> %d\n", galloc->n_leafs, graph->n_leafs);
+        }
         return true;
     }
 
@@ -1028,6 +1047,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
+            if (ggml_gallocr_trace_enabled()) {
+                GGML_LOG_WARN("galloc_realloc: node %d %s (op %s) invalid\n", i, node->name, ggml_op_name(node->op));
+            }
             return true;
         }
 
@@ -1040,6 +1062,9 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
+                if (ggml_gallocr_trace_enabled()) {
+                    GGML_LOG_WARN("galloc_realloc: node %d %s src %d %s invalid\n", i, node->name, j, src->name);
+                }
                 return true;
             }
         }

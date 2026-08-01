@@ -1100,7 +1100,10 @@ struct mtmd_tokenizer {
                 img_u8.cpy_buf(bmp->get_ro_buf());
 
                 // preprocess image
+                const int64_t t_pp0 = ggml_time_ms();
                 mtmd_image_preproc_out tmp_preproc_out = ctx->image_preproc->preprocess(img_u8);
+                LOG_WRN("%s: image preprocess %dx%d took %" PRId64 " ms\n",
+                        __func__, (int)bmp->nx, (int)bmp->ny, ggml_time_ms() - t_pp0);
 
                 // move entries and grid dimensions to the "global" preproc_out
                 for (auto & entry : tmp_preproc_out.entries) {

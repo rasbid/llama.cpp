@@ -3826,9 +3826,11 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     }
 
     // build the inference graph
+    const int64_t t_enc_start = ggml_time_ms();
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs)->build();
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    const int64_t t_enc_alloc = ggml_time_ms();
 
     // set inputs
     const auto & model   = ctx->model;
@@ -4867,6 +4869,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
             GGML_ABORT("Unknown projector type");
     }
 
+    const int64_t t_enc_inputs = ggml_time_ms();
+
     // ggml_backend_cpu_set_n_threads(ctx->backend_cpu, n_threads);
     ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend_cpu);
     ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -4881,6 +4885,13 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    {
+        const int64_t t_enc_done = ggml_time_ms();
+        LOG_WRN("%s: image %dx%d: graph+alloc %" PRId64 " ms, set_inputs %" PRId64 " ms, compute %" PRId64 " ms, total %" PRId64 " ms\n",
+                __func__, imgs.entries[0].nx(), imgs.entries[0].ny(),
+                t_enc_alloc - t_enc_start, t_enc_inputs - t_enc_alloc,
+                t_enc_done - t_enc_inputs, t_enc_done - t_enc_start);
     }
 
     // the last node is the embedding tensor
@@ -4904,7 +4915,10 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
             LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
             GGML_ABORT("Output buffer size mismatch");
         }
+        const int64_t t_get0 = ggml_time_ms();
         ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
+        LOG_WRN("%s: embeddings readback %zu bytes took %" PRId64 " ms\n",
+                __func__, ggml_nbytes(embeddings), ggml_time_ms() - t_get0);
     } else {
         LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
     }
