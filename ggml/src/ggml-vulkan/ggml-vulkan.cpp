@@ -3559,6 +3559,7 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         if ((s = getenv("GGML_VK_FA_RS")) != nullptr) { result.row_split      = (uint32_t) atoi(s); }
         if ((s = getenv("GGML_VK_FA_WS")) != nullptr) { result.workgroup_size = (uint32_t) atoi(s); }
         if ((s = getenv("GGML_VK_FA_DS")) != nullptr) { result.d_split        = (uint32_t) atoi(s); }
+        if ((s = getenv("GGML_VK_FA_STAGE")) != nullptr) { result.shmem_staging = (uint32_t) atoi(s); }
     }
 
     while (result.block_rows > 1 && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
