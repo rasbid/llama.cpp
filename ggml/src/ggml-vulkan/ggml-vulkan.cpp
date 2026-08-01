@@ -3536,6 +3536,13 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
 
         result.block_cols = (D & 8) ? 64 : 32;
+
+        // Measured on gfx803 (ViT encode, hsk 80, n_kv 15552): 64 columns
+        // beat 32 by ~4%; 16 and other param deviations were worse or broke
+        // output correctness.
+        if (device->architecture == AMD_GCN && n_rows >= 64 && n_kv >= 4096) {
+            result.block_cols = 64;
+        }
     }
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
@@ -3544,7 +3551,17 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
-    if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+    // Tuning-sweep overrides; the defaults above were never measured on GCN.
+    {
+        const char * s;
+        if ((s = getenv("GGML_VK_FA_BR")) != nullptr) { result.block_rows     = (uint32_t) atoi(s); }
+        if ((s = getenv("GGML_VK_FA_BC")) != nullptr) { result.block_cols     = (uint32_t) atoi(s); }
+        if ((s = getenv("GGML_VK_FA_RS")) != nullptr) { result.row_split      = (uint32_t) atoi(s); }
+        if ((s = getenv("GGML_VK_FA_WS")) != nullptr) { result.workgroup_size = (uint32_t) atoi(s); }
+        if ((s = getenv("GGML_VK_FA_DS")) != nullptr) { result.d_split        = (uint32_t) atoi(s); }
+    }
+
+    while (result.block_rows > 1 && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
     }
 
